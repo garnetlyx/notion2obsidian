@@ -48,7 +48,8 @@ import {
   generateDatabaseIndex,
   generateSqlSealIndex,
   createNotesFromCsvRows,
-  generateDataviewIndex
+  generateDataviewIndex,
+  generateBaseFile
 } from "./src/lib/csv.js";
 import { enrichVault } from "./src/lib/enrich.js";
 
@@ -161,6 +162,30 @@ async function main() {
   } else if (directories.length === 1) {
     // Single directory
     targetDir = directories[0];
+
+    // If output directory is specified, copy content there
+    if (config.outputDir) {
+      const { cp } = await import('node:fs/promises');
+      console.log(chalk.cyan('📋 Copying content to output directory...'));
+      await mkdir(config.outputDir, { recursive: true });
+
+      // Copy all content from source to output directory
+      const sourceEntries = await readdir(targetDir);
+      for (const entry of sourceEntries) {
+        const sourcePath = join(targetDir, entry);
+        const targetPath = join(config.outputDir, entry);
+
+        // Use recursive copy for directories
+        if ((await stat(sourcePath)).isDirectory()) {
+          await cp(sourcePath, targetPath, { recursive: true, force: true });
+        } else {
+          await copyFile(sourcePath, targetPath);
+        }
+      }
+
+      targetDir = config.outputDir;
+      console.log(chalk.green('✓ Content copied to output directory\n'));
+    }
 
     // Check write permissions
     try {
@@ -927,13 +952,17 @@ async function main() {
 
   // Step 6: Process CSV databases if enabled
   if (config.processCsv) {
-    console.log(chalk.green(config.dataviewMode ?
-      'Step 6: Processing CSV databases with Dataview support...' :
-      'Step 6: Processing CSV databases...'));
+    const modeText = config.basesMode 
+      ? 'with Obsidian Bases support...' 
+      : config.dataviewMode 
+        ? 'with Dataview support...' 
+        : '';
+    console.log(chalk.green(`Step 6: Processing CSV databases ${modeText}`));
 
     const csvFiles = await processCsvDatabases(targetDir);
     let csvIndexesCreated = 0;
     let totalNotesCreated = 0;
+    let baseFilesCreated = 0;
 
     // Create _databases folder if in Dataview mode
     let databasesDir = null;
@@ -944,7 +973,30 @@ async function main() {
 
     for (const csvInfo of csvFiles) {
       try {
-        if (config.dataviewMode) {
+        if (config.basesMode) {
+          // Bases mode: Create individual notes with proper tags and generate .base file
+          const baseDir = dirname(csvInfo.path);
+          const dbDir = join(baseDir, csvInfo.databaseName);
+
+          // Create individual notes from CSV rows (same as dataview mode but with path-based tags)
+          const createdNotes = await createNotesFromCsvRows(csvInfo, targetDir, databasesDir);
+          totalNotesCreated += createdNotes.length;
+
+          // Generate .base file
+          const baseFileContent = generateBaseFile(csvInfo, targetDir);
+          const basePath = join(baseDir, `${csvInfo.databaseName}.base`);
+          await Bun.write(basePath, baseFileContent);
+          baseFilesCreated++;
+
+          // Generate index page
+          const indexMarkdown = generateDataviewIndex(csvInfo, targetDir, createdNotes);
+          const indexPath = join(baseDir, `${csvInfo.databaseName}_Index.md`);
+          await Bun.write(indexPath, indexMarkdown);
+
+          if (config.verbose) {
+            console.log(`    ✓ Created ${createdNotes.length} notes, .base file, and index for ${csvInfo.databaseName}`);
+          }
+        } else if (config.dataviewMode) {
           // Dataview mode: Copy CSV to _databases folder and create individual notes
           const csvDestPath = join(databasesDir, csvInfo.fileName + '.csv');
           await copyFile(csvInfo.path, csvDestPath);
@@ -1066,7 +1118,10 @@ async function main() {
     stats.csvFilesProcessed = csvFiles.length;
     stats.csvIndexesCreated = csvIndexesCreated;
 
-    if (config.dataviewMode && totalNotesCreated > 0) {
+    if (config.basesMode && totalNotesCreated > 0) {
+      stats.csvNotesCreated = totalNotesCreated;
+      console.log(`  ${chalk.green('✓')} Processed ${csvFiles.length} CSV files, created ${totalNotesCreated} notes, ${baseFilesCreated} .base files, and ${csvIndexesCreated} indexes\n`);
+    } else if (config.dataviewMode && totalNotesCreated > 0) {
       stats.csvNotesCreated = totalNotesCreated;
       console.log(`  ${chalk.green('✓')} Processed ${csvFiles.length} CSV files, created ${totalNotesCreated} individual notes and ${csvIndexesCreated} Dataview indexes\n`);
     } else {

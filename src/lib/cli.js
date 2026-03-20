@@ -19,6 +19,7 @@ export function parseArgs() {
     processCsv: true,
     dataviewMode: false,  // Default to traditional mode (CSV only, no individual MD files)
     sqlsealMode: false,  // Use SQL Seal queries instead of Dataview
+    basesMode: false,  // Use Obsidian Bases instead of Dataview/SQL Seal
     enrich: false  // Enrichment mode
   };
 
@@ -51,6 +52,9 @@ export function parseArgs() {
       config.dataviewMode = true;  // Enable individual MD file creation from CSV rows
     } else if (arg === '--sqlseal') {
       config.sqlsealMode = true;  // Use SQL Seal instead of Dataview for CSV queries
+    } else if (arg === '--bases') {
+      config.basesMode = true;  // Use Obsidian Bases instead of Dataview/SQL Seal
+      config.dataviewMode = true;  // Bases needs individual notes to query
     } else if (arg === '--enrich') {
       config.enrich = true;
     } else if (!arg.startsWith('-')) {
