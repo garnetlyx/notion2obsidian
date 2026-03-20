@@ -13,11 +13,24 @@ export function extractInlineMetadataFromLines(lines) {
 
   for (const line of lines) {
     if (line.startsWith('Status:')) metadata.status = line.substring(7).trim();
-    if (line.startsWith('Owner:')) metadata.owner = line.substring(6).trim();
-    if (line.startsWith('Dates:')) metadata.dates = line.substring(6).trim();
-    if (line.startsWith('Priority:')) metadata.priority = line.substring(9).trim();
-    if (line.startsWith('Completion:')) metadata.completion = parseFloat(line.substring(11).trim());
-    if (line.startsWith('Summary:')) metadata.summary = line.substring(8).trim();
+    else if (line.startsWith('Owner:')) metadata.owner = line.substring(6).trim();
+    else if (line.startsWith('Dates:')) metadata.dates = line.substring(6).trim();
+    else if (line.startsWith('Priority:')) metadata.priority = line.substring(9).trim();
+    else if (line.startsWith('Completion:')) metadata.completion = parseFloat(line.substring(11).trim());
+    else if (line.startsWith('Summary:')) metadata.summary = line.substring(8).trim();
+    else {
+      // Extract any other Key: Value properties (for Notion database properties)
+      const match = line.match(/^([A-Za-z][A-Za-z0-9 _\u4e00-\u9fa5-]*):\s*(.+)$/);
+      if (match) {
+        const key = match[1].toLowerCase()
+          .replace(/\s+/g, '-')
+          .replace(/[^a-z0-9\u4e00-\u9fa5-]/g, '');
+        const value = match[2].trim();
+        if (key && value && !metadata[key]) {
+          metadata[key] = value;
+        }
+      }
+    }
   }
 
   return metadata;

@@ -974,27 +974,84 @@ async function main() {
     for (const csvInfo of csvFiles) {
       try {
         if (config.basesMode) {
-          // Bases mode: Create individual notes with proper tags and generate .base file
-          const baseDir = dirname(csvInfo.path);
+          // Bases mode: Move notes to _data, add 'data' tag, generate .base file
+          const csvDir = dirname(csvInfo.path);
+          const baseDir = csvDir;
           const dbDir = join(baseDir, csvInfo.databaseName);
 
-          // Create individual notes from CSV rows (same as dataview mode but with path-based tags)
-          const createdNotes = await createNotesFromCsvRows(csvInfo, targetDir, databasesDir);
-          totalNotesCreated += createdNotes.length;
+          // Move individual MD files to _data subfolder if database directory exists
+          try {
+            const dirStat = statSync(dbDir);
 
-          // Generate .base file
+            if (dirStat.isDirectory()) {
+              const dataDir = join(dbDir, '_data');
+              await mkdir(dataDir, { recursive: true });
+
+              // Move all .md files from database directory to _data and update frontmatter
+              const files = readdirSync(dbDir);
+              for (const file of files) {
+                if (file.endsWith('.md')) {
+                  const sourcePath = join(dbDir, file);
+                  const destPath = join(dataDir, file);
+                  await rename(sourcePath, destPath);
+
+                  // Update frontmatter and convert relative links to wiki links
+                  let content = await Bun.file(destPath).text();
+                  
+                  // Add 'data' tag to frontmatter if not present
+                  if (!content.includes('"data"')) {
+                    content = content.replace(
+                      /(tags:\s*\n((?:\s*-\s*"[^"]*"\s*\n)*))/,
+                      (match, fullMatch, tagLines) => {
+                        if (tagLines.includes('"data"')) return match;
+                        return fullMatch + '  - "data"\n';
+                      }
+                    );
+                  }
+                  
+                  // Convert markdown links to wiki links
+                  const mdLinkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
+                  content = content.replace(mdLinkRegex, (fullMatch, linkText, linkPath) => {
+                    const link = `[${linkText}](${linkPath})`;
+                    return convertMarkdownLinkToWiki(link, fileMap, destPath);
+                  });
+
+                  // Convert Notion property links only in content body (after frontmatter)
+                  const contentStart = content.indexOf('\n---\n');
+                  if (contentStart !== -1) {
+                    const frontmatter = content.slice(0, contentStart + 5);
+                    const body = content.slice(contentStart + 5);
+                    
+                    const bodyWithWikiLinks = body.replace(/^(\w+):\s+([^(\n]+?)\s*\(([^)]+\.md[^)]*)\)/gm, (match, property, text, path) => {
+                      const pathParts = path.split('/');
+                      const targetFilename = pathParts[pathParts.length - 1];
+                      const cleanedFilename = cleanName(targetFilename).replace('.md', '');
+                      return `${property}: [[${cleanedFilename}|${text.trim()}]]`;
+                    });
+                    
+                    content = frontmatter + bodyWithWikiLinks;
+                  }
+                  
+                  await Bun.write(destPath, content);
+                }
+              }
+
+              if (config.verbose) {
+                console.log(`    ✓ Moved ${files.filter(f => f.endsWith('.md')).length} MD files to ${csvInfo.databaseName}/_data/`);
+              }
+            }
+          } catch (error) {
+            // Directory doesn't exist, skip
+          }
+          
+          // Generate .base file in same directory as CSV
           const baseFileContent = generateBaseFile(csvInfo, targetDir);
-          const basePath = join(baseDir, `${csvInfo.databaseName}.base`);
+          const basePath = join(csvDir, `${csvInfo.databaseName}.base`);
           await Bun.write(basePath, baseFileContent);
           baseFilesCreated++;
 
-          // Generate index page
-          const indexMarkdown = generateDataviewIndex(csvInfo, targetDir, createdNotes);
-          const indexPath = join(baseDir, `${csvInfo.databaseName}_Index.md`);
-          await Bun.write(indexPath, indexMarkdown);
-
           if (config.verbose) {
-            console.log(`    ✓ Created ${createdNotes.length} notes, .base file, and index for ${csvInfo.databaseName}`);
+            console.log(`    ✓ Created .base file for ${csvInfo.databaseName}`);
           }
         } else if (config.dataviewMode) {
           // Dataview mode: Copy CSV to _databases folder and create individual notes
@@ -1026,13 +1083,26 @@ async function main() {
               const dataDir = join(dbDir, '_data');
               await mkdir(dataDir, { recursive: true });
 
-              // Move all .md files from database directory to _data
+              // Move all .md files from database directory to _data and update frontmatter
               const files = readdirSync(dbDir);
               for (const file of files) {
                 if (file.endsWith('.md')) {
                   const sourcePath = join(dbDir, file);
                   const destPath = join(dataDir, file);
                   await rename(sourcePath, destPath);
+
+                  // Update frontmatter to include 'data' tag for Bases filtering
+                  const content = await Bun.file(destPath).text();
+                  const updatedContent = content.replace(
+                    /^(tags:\s*(?:\n\s*-\s*"[^"]*")*)/m,
+                    (match, tagBlock) => {
+                      if (match.includes('"data"')) return match; // Already has 'data' tag
+                      return tagBlock + '\n  - "data"';
+                    }
+                  );
+                  if (updatedContent !== content) {
+                    await Bun.write(destPath, updatedContent);
+                  }
                 }
               }
 

@@ -188,8 +188,8 @@ export async function createNotesFromCsvRows(csvInfo, targetDir, databasesDir) {
   const { databaseName, header, rows, fileName } = csvInfo;
   const createdNotes = [];
 
-  // Create notes in the SAME directory as the CSV file, inside a _data subfolder
-  // This preserves the directory hierarchy and matches .base file filter expectations
+  // Notes are created in _data subfolder next to the database folder
+  // CSV at Gemology/Gem Catalogue.csv → Notes in Gemology/Gem Catalogue/_data/
   const csvDir = dirname(csvInfo.path);
   const notesDir = join(csvDir, databaseName, '_data');
   await mkdir(notesDir, { recursive: true });
@@ -236,15 +236,24 @@ export async function createNotesFromCsvRows(csvInfo, targetDir, databasesDir) {
       }
     });
 
-    // Generate clean filename
     const cleanTitle = title
-      .replace(/[^a-zA-Z0-9\s-]/g, '') // Remove special chars
-      .replace(/\s+/g, '-')            // Spaces to hyphens
-      .toLowerCase()
-      .slice(0, 50);                   // Limit length
+      .replace(/[<>:"/\\|?*]/g, '-')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 50);
 
     const noteFileName = `${cleanTitle || `record-${i + 1}`}.md`;
     const notePath = join(notesDir, noteFileName);
+
+    // Skip if note already exists (avoid duplicates)
+    try {
+      await Bun.file(notePath).text();
+      createdNotes.push(notePath);
+      continue;
+    } catch {
+      // File doesn't exist, proceed with creation
+    }
 
     // Generate markdown content
     let content = generateValidFrontmatter(frontmatter, '');
@@ -427,8 +436,9 @@ function detectColumnTypes(header, rows) {
  * @returns {Object} - Filter configuration
  */
 function generateBaseFilters(tags) {
-  // Build filter expressions - notes must have ALL the path-derived tags
-  const tagFilters = tags.map(tag => `file.hasTag("${tag}")`);
+  // Add 'data' tag to match _data folder notes
+  const allTags = [...tags, 'data'];
+  const tagFilters = allTags.map(tag => `file.hasTag("${tag}")`);
   
   return {
     and: [
