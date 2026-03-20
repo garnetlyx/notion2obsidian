@@ -129,13 +129,21 @@ export function generateValidFrontmatter(metadata, relativePath) {
   // Add banner image if provided
   if (metadata.banner) frontmatterData.banner = metadata.banner;
 
-  // Add inline metadata if found
-  if (metadata.status) frontmatterData.status = metadata.status;
-  if (metadata.owner) frontmatterData.owner = metadata.owner;
-  if (metadata.dates) frontmatterData.dates = metadata.dates;
-  if (metadata.priority) frontmatterData.priority = metadata.priority;
-  if (metadata.completion !== undefined) frontmatterData.completion = metadata.completion;
-  if (metadata.summary) frontmatterData.summary = metadata.summary;
+  // Add inline metadata and database properties dynamically
+  // Skip keys that are handled separately or are internal
+  const skipKeys = new Set(['title', 'tags', 'aliases', 'notionId', 'folder', 'banner', 'published']);
+  
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!skipKeys.has(key) && value) {
+      // Convert key to kebab-case for consistency
+      const normalizedKey = key.toLowerCase()
+        .replace(/\s+/g, '-')
+        .replace(/[^a-z0-9\u4e00-\u9fa5-]/g, '');
+      if (normalizedKey && !frontmatterData[normalizedKey]) {
+        frontmatterData[normalizedKey] = value;
+      }
+    }
+  }
 
   // Always set published to false
   frontmatterData.published = false;
@@ -247,6 +255,83 @@ export function cleanAssetPaths(content, dirNameMap) {
 // File Processing
 // ============================================================================
 
+/**
+ * Extracts Notion database properties from content body to frontmatter
+ * Properties are in format: Key: Value (one per line, after first heading)
+ * @param {Array} lines - Content lines
+ * @returns {Object} - Extracted properties and remaining content lines
+ */
+export function extractDatabaseProperties(lines) {
+  const properties = {};
+  let foundFirstHeading = false;
+  let propertiesEndIndex = -1;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    
+    // Skip empty lines before first heading
+    if (!line && !foundFirstHeading) {
+      continue;
+    }
+    
+    // Found first heading (starts with #)
+    if (line.startsWith('#')) {
+      foundFirstHeading = true;
+      continue;
+    }
+    
+    // After first heading, extract Key: Value properties
+    if (foundFirstHeading) {
+      // Match property pattern: Key: Value (but not URLs or complex values)
+      const propertyMatch = line.match(/^([A-Za-z][A-Za-z0-9_\u4e00-\u9fa5]*):\s*(.+)$/);
+      
+      if (propertyMatch) {
+        const key = propertyMatch[1];
+        const value = propertyMatch[2].trim();
+        
+        // Skip if value looks like it's part of a paragraph (contains multiple sentences)
+        // or if it's clearly not a property (starts with !, [, etc.)
+        if (line.startsWith('-') || line.startsWith('!') || line.startsWith('[') || line.startsWith('*')) {
+          // Not a property line
+          propertiesEndIndex = i;
+          break;
+        }
+        
+        // Convert key to kebab-case for frontmatter
+        const frontmatterKey = key.toLowerCase()
+          .replace(/\s+/g, '-')
+          .replace(/[^a-z0-9\u4e00-\u9fa5-]/g, '');
+        
+        properties[frontmatterKey] = value;
+      } else if (line && !line.startsWith('-')) {
+        // Non-empty line that's not a property or list item - properties section has ended
+        propertiesEndIndex = i;
+        break;
+      }
+    }
+  }
+  
+  // Remove extracted property lines from content
+  if (foundFirstHeading && propertiesEndIndex > 0) {
+    // Find the heading line index
+    let headingIndex = -1;
+    for (let i = 0; i < propertiesEndIndex; i++) {
+      if (lines[i].trim().startsWith('#')) {
+        headingIndex = i;
+        break;
+      }
+    }
+    
+    if (headingIndex >= 0) {
+      // Keep heading and everything after properties
+      const remainingLines = [lines[headingIndex], ...lines.slice(propertiesEndIndex)];
+      return { properties, remainingLines };
+    }
+  }
+  
+  return { properties, remainingLines: lines };
+}
+
 export async function processFileContent(filePath, metadata, fileMap, baseDir, dirNameMap = new Map()) {
   const file = Bun.file(filePath);
   const content = await file.text();
@@ -258,18 +343,23 @@ export async function processFileContent(filePath, metadata, fileMap, baseDir, d
 
   const lines = content.split('\n');
 
-  // Extract inline metadata from content
-  const inlineMetadata = extractInlineMetadataFromLines(lines.slice(0, 30));
+  // Extract Notion database properties from content body
+  const { properties: dbProperties, remainingLines } = extractDatabaseProperties(lines);
+  Object.assign(metadata, dbProperties);
+
+  // Extract inline metadata from remaining content
+  const inlineMetadata = extractInlineMetadataFromLines(remainingLines.slice(0, 30));
   Object.assign(metadata, inlineMetadata);
 
   // Check if file already has valid Obsidian frontmatter
-  const hasFrontmatter = hasValidFrontmatter(content);
+  const hasFrontmatter = hasValidFrontmatter(remainingLines.join('\n'));
 
   // Add folder path to metadata
   const relativePath = relative(baseDir, dirname(filePath));
   metadata.folder = relativePath !== '.' ? relativePath : undefined;
 
-  let newContent = content;
+  // Content with properties already extracted
+  let newContent = remainingLines.join('\n');
 
   // Convert Notion callouts to Obsidian callouts
   const { content: contentAfterCallouts, calloutsConverted } = convertNotionCallouts(newContent);
