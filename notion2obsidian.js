@@ -18,6 +18,7 @@ import {
   BATCH_SIZE,
   isHexString,
   extractNotionId,
+  normalizeTitle,
   sanitizeFilename,
   shortenFilename,
   cleanName,
@@ -49,9 +50,123 @@ import {
   generateSqlSealIndex,
   createNotesFromCsvRows,
   generateDataviewIndex,
-  generateBaseFile
+  generateBaseFile,
+  enrichMdWithCsvProperties,
+  generateMissingMdFromCsv,
+  stripNotionUrlFromTitle,
+  findBasesReconciliationIssues,
+  buildRowTitleMatchSkeletons
 } from "./src/lib/csv.js";
 import { enrichVault } from "./src/lib/enrich.js";
+
+async function deriveNameFromHeading(filePath, cleanedName) {
+  const currentBase = basename(cleanedName, '.md');
+  const currentNormalized = normalizeTitle(currentBase);
+  if (!currentNormalized || currentNormalized.length < 20) return cleanedName;
+
+  let content;
+  try {
+    content = await Bun.file(filePath).text();
+  } catch {
+    return cleanedName;
+  }
+
+  const headingMatch = content.match(/^#\s+(.+)$/m);
+  if (!headingMatch) return cleanedName;
+
+  const headingTitle = sanitizeFilename(headingMatch[1].trim()).slice(0, 180).trim();
+  if (!headingTitle) return cleanedName;
+
+  const headingNormalized = normalizeTitle(headingTitle);
+  if (!headingNormalized) return cleanedName;
+  const looksMojibake = /[ÃÂâ]/.test(currentBase);
+  if (!headingNormalized.startsWith(currentNormalized)) {
+    if (!looksMojibake) return cleanedName;
+  }
+  if (headingTitle.length <= currentBase.length && !looksMojibake) return cleanedName;
+
+  return `${headingTitle}.md`;
+}
+
+function buildMdDirectoryIndex(targetDir) {
+  const index = new Map();
+  const mdGlob = new Glob('**/*.md');
+  for (const relPath of mdGlob.scanSync(targetDir)) {
+    const fullPath = join(targetDir, relPath);
+    const dir = dirname(fullPath);
+    const base = basename(fullPath, '.md');
+    const cleaned = cleanName(`${base}.md`).replace(/\.md$/, '');
+    const normalizedBase = normalizeTitle(base);
+    const normalizedCleaned = normalizeTitle(cleaned);
+    const entry = { fullPath, normalizedBase, normalizedCleaned };
+    if (!index.has(dir)) index.set(dir, []);
+    index.get(dir).push(entry);
+  }
+  return index;
+}
+
+function resolveDatabaseRowDirectory(csvInfo, mdDirectoryIndex, targetDir) {
+  const csvDir = dirname(csvInfo.path);
+  const rowTitleSet = new Set();
+  for (const row of csvInfo.rows) {
+    const raw = (row[0] || '').replace(/^"|"$/g, '').trim();
+    const titleSkeletons = buildRowTitleMatchSkeletons(raw, 'Untitled');
+    for (const normalized of titleSkeletons) {
+      if (normalized) rowTitleSet.add(normalized);
+    }
+  }
+
+  if (rowTitleSet.size === 0) {
+    return { type: 'none', dir: csvDir, bestScore: 0 };
+  }
+
+  const scores = [];
+  for (const [dir, entries] of mdDirectoryIndex.entries()) {
+    let matchCount = 0;
+    for (const entry of entries) {
+      if (rowTitleSet.has(entry.normalizedBase) || rowTitleSet.has(entry.normalizedCleaned)) {
+        matchCount++;
+      }
+    }
+    if (matchCount > 0) {
+      const ratio = matchCount / Math.max(1, Math.min(entries.length, rowTitleSet.size));
+      const csvParent = dirname(csvDir);
+      const isSameDir = dir === csvDir;
+      const isNearby = dir.startsWith(`${csvParent}${sep}`) || csvDir.startsWith(`${dir}${sep}`);
+      const localityBonus = isSameDir ? 0.2 : isNearby ? 0.1 : 0;
+      scores.push({ dir, matchCount, ratio, weightedScore: matchCount + ratio + localityBonus });
+    }
+  }
+
+  if (scores.length === 0) {
+    return { type: 'none', dir: csvDir, bestScore: 0 };
+  }
+
+  scores.sort((a, b) => b.weightedScore - a.weightedScore || b.matchCount - a.matchCount || b.ratio - a.ratio);
+  const best = scores[0];
+  const second = scores[1];
+  const minRequired = rowTitleSet.size >= 20 ? 5 : rowTitleSet.size >= 10 ? 3 : rowTitleSet.size >= 4 ? 2 : 1;
+  const coverage = best.matchCount / Math.max(1, rowTitleSet.size);
+  const confident = best.matchCount >= minRequired && best.ratio >= 0.25 && coverage >= 0.2;
+
+  if (!confident) {
+    return { type: 'none', dir: csvDir, bestScore: best.matchCount, bestDir: best.dir };
+  }
+
+  if (second) {
+    const tieLike = Math.abs(second.weightedScore - best.weightedScore) < 0.5;
+    const weakLead = (best.matchCount - second.matchCount) < 2;
+    if (tieLike || weakLead) {
+      return { type: 'ambiguous', dir: csvDir, bestScore: best.matchCount, bestDir: best.dir };
+    }
+  }
+
+  if (coverage < 0.3 && rowTitleSet.size >= 6) {
+    return { type: 'ambiguous', dir: csvDir, bestScore: best.matchCount, bestDir: best.dir };
+  }
+
+  return { type: 'matched', dir: best.dir, bestScore: best.matchCount, bestDir: best.dir };
+}
 
 // ============================================================================
 // Runtime Check
@@ -348,6 +463,10 @@ async function main() {
       }
     }
 
+    if (notionId) {
+      cleanedName = await deriveNameFromHeading(filePath, cleanedName);
+    }
+
     const tags = getTagsFromPath(filePath, targetDir);
 
     // Build aliases
@@ -371,6 +490,15 @@ async function main() {
       metadata: metadata,
       needsRename: filename !== cleanedName
     });
+  }
+
+  for (const file of fileMigrationMap) {
+    const filename = basename(file.oldPath);
+    const entry = fileMap.get(filename);
+    if (entry) entry.cleanedName = file.newName;
+    const encoded = encodeURIComponent(filename);
+    const encodedEntry = fileMap.get(encoded);
+    if (encodedEntry) encodedEntry.cleanedName = file.newName;
   }
 
   // Process directories
@@ -492,9 +620,9 @@ async function main() {
     const batch = fileMigrationMap.slice(i, i + BATCH_SIZE);
 
     const results = await Promise.all(
-      batch.map(file =>
-        updateFileContent(file.oldPath, file.metadata, fileMap, targetDir, dirNameMap)
-      )
+      batch.map(file => {
+        return updateFileContent(file.oldPath, file.metadata, fileMap, targetDir, dirNameMap);
+      })
     );
 
     results.forEach((result, idx) => {
@@ -941,6 +1069,7 @@ async function main() {
     newContent = newContent.replace(/\\(\()/g, '$1'); // Fix any escaped opening parenthesis
     newContent = newContent.replace(/\\(\))/g, '$1'); // Fix any escaped closing parenthesis
     newContent = newContent.replace(/\\(~)/g, '$1'); // Fix any escaped tildes (strikethrough)
+    newContent = newContent.replace(/\\(_)/g, '$1'); // Fix any escaped underscores (emphasis)
 
     // Only write if content actually changed
     if (newContent !== content) {
@@ -963,91 +1092,94 @@ async function main() {
     let csvIndexesCreated = 0;
     let totalNotesCreated = 0;
     let baseFilesCreated = 0;
+    const rowMatchAbstained = [];
+    const mdDirectoryIndex = buildMdDirectoryIndex(targetDir);
+    const globalExistingSkeletons = [];
+    const seenSkeletons = new Set();
+    for (const entries of mdDirectoryIndex.values()) {
+      for (const entry of entries) {
+        for (const skeleton of [entry.normalizedBase, entry.normalizedCleaned]) {
+          if (!skeleton || seenSkeletons.has(skeleton)) continue;
+          seenSkeletons.add(skeleton);
+          globalExistingSkeletons.push(skeleton);
+        }
+      }
+    }
 
-    // Create _databases folder if in Dataview mode
+    // Create _databases folder if in Dataview mode (not used in bases mode)
     let databasesDir = null;
-    if (config.dataviewMode && csvFiles.length > 0) {
+    if (config.dataviewMode && !config.basesMode && csvFiles.length > 0) {
       databasesDir = join(targetDir, '_databases');
       await mkdir(databasesDir, { recursive: true });
     }
 
+    // Map databaseName → actual wikilink target for post-processing rewrite
+    const csvWikilinkMap = new Map();
+
     for (const csvInfo of csvFiles) {
       try {
         if (config.basesMode) {
-          // Bases mode: Move notes to _data, add 'data' tag, generate .base file
           const csvDir = dirname(csvInfo.path);
-          const baseDir = csvDir;
-          const dbDir = join(baseDir, csvInfo.databaseName);
+          const resolvedRowDir = resolveDatabaseRowDirectory(csvInfo, mdDirectoryIndex, targetDir);
+          let dbDir = resolvedRowDir.dir;
 
-          // Move individual MD files to _data subfolder if database directory exists
-          try {
-            const dirStat = statSync(dbDir);
+          let enrichResult = { enriched: 0, skipped: 0 };
+          let createdCount = 0;
 
-            if (dirStat.isDirectory()) {
-              const dataDir = join(dbDir, '_data');
-              await mkdir(dataDir, { recursive: true });
+          if (resolvedRowDir.type === 'matched') {
+            enrichResult = await enrichMdWithCsvProperties(csvInfo, dbDir);
+            const abstainBefore = rowMatchAbstained.length;
+            createdCount = await generateMissingMdFromCsv(csvInfo, dbDir, {
+              globalExistingSkeletons,
+              allowCreateDir: false,
+              abstainCollector: rowMatchAbstained
+            });
+            totalNotesCreated += createdCount;
 
-              // Move all .md files from database directory to _data and update frontmatter
-              const files = readdirSync(dbDir);
-              for (const file of files) {
-                if (file.endsWith('.md')) {
-                  const sourcePath = join(dbDir, file);
-                  const destPath = join(dataDir, file);
-                  await rename(sourcePath, destPath);
-
-                  // Update frontmatter and convert relative links to wiki links
-                  let content = await Bun.file(destPath).text();
-                  
-                  // Add 'data' tag to frontmatter if not present
-                  if (!content.includes('"data"')) {
-                    content = content.replace(
-                      /(tags:\s*\n((?:\s*-\s*"[^"]*"\s*\n)*))/,
-                      (match, fullMatch, tagLines) => {
-                        if (tagLines.includes('"data"')) return match;
-                        return fullMatch + '  - "data"\n';
-                      }
-                    );
-                  }
-                  
-                  // Convert markdown links to wiki links
-                  const mdLinkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-                  content = content.replace(mdLinkRegex, (fullMatch, linkText, linkPath) => {
-                    const link = `[${linkText}](${linkPath})`;
-                    return convertMarkdownLinkToWiki(link, fileMap, destPath);
-                  });
-
-                  // Convert Notion property links only in content body (after frontmatter)
-                  const contentStart = content.indexOf('\n---\n');
-                  if (contentStart !== -1) {
-                    const frontmatter = content.slice(0, contentStart + 5);
-                    const body = content.slice(contentStart + 5);
-                    
-                    const bodyWithWikiLinks = body.replace(/^(\w+):\s+([^(\n]+?)\s*\(([^)]+\.md[^)]*)\)/gm, (match, property, text, path) => {
-                      const pathParts = path.split('/');
-                      const targetFilename = pathParts[pathParts.length - 1];
-                      const cleanedFilename = cleanName(targetFilename).replace('.md', '');
-                      return `${property}: [[${cleanedFilename}|${text.trim()}]]`;
-                    });
-                    
-                    content = frontmatter + bodyWithWikiLinks;
-                  }
-                  
-                  await Bun.write(destPath, content);
-                }
-              }
-
-              if (config.verbose) {
-                console.log(`    ✓ Moved ${files.filter(f => f.endsWith('.md')).length} MD files to ${csvInfo.databaseName}/_data/`);
+            if (config.verbose) {
+              const abstainedForDb = rowMatchAbstained.length - abstainBefore;
+              if (abstainedForDb > 0) {
+                console.log(`    ⚠ Abstained ${abstainedForDb} uncertain row-note match(es) for ${csvInfo.databaseName}`);
               }
             }
-          } catch (error) {
-            // Directory doesn't exist, skip
           }
-          
-          // Generate .base file in same directory as CSV
-          const baseFileContent = generateBaseFile(csvInfo, targetDir);
-          const basePath = join(csvDir, `${csvInfo.databaseName}.base`);
+
+          if (config.verbose) {
+            console.log(`    ✓ Enriched ${enrichResult.enriched} MD files with CSV data`);
+            if (resolvedRowDir.type === 'matched') {
+              console.log(`    ✓ Row directory matched: ${relative(targetDir, dbDir)} (${resolvedRowDir.bestScore} title matches)`);
+            } else {
+              console.log(`    ⚠ Row directory unresolved (${resolvedRowDir.type}); skipped row-note generation for ${csvInfo.databaseName}`);
+            }
+          }
+
+          if (config.verbose && createdCount > 0) {
+            console.log(`    ✓ Generated ${createdCount} MD files from CSV rows`);
+          }
+
+          // Clean CSV filename: strip Notion ID, rename on disk
+          const cleanCsvName = csvInfo.resolvedCsvFileName || `${csvInfo.databaseName}.csv`;
+          const cleanCsvPath = join(csvDir, cleanCsvName);
+          if (csvInfo.path !== cleanCsvPath) {
+            try {
+              await rename(csvInfo.path, cleanCsvPath);
+              // Also remove the non-_all variant if it exists
+              const nonAllPath = csvInfo.path.replace(/_all\.csv$/, '.csv');
+              if (nonAllPath !== csvInfo.path) {
+                await rm(nonAllPath).catch(() => {});
+              }
+            } catch {
+              // If rename fails, it's non-critical
+            }
+          }
+
+          csvInfo.path = cleanCsvPath;
+
+          const baseFileContent = generateBaseFile(csvInfo, targetDir, dbDir);
+          const baseFileName = csvInfo.resolvedBaseFileName || `${csvInfo.databaseName}.base`;
+          const basePath = join(csvDir, baseFileName);
           await Bun.write(basePath, baseFileContent);
+          csvWikilinkMap.set(csvInfo.databaseName, baseFileName);
           baseFilesCreated++;
 
           if (config.verbose) {
@@ -1055,7 +1187,7 @@ async function main() {
           }
         } else if (config.dataviewMode) {
           // Dataview mode: Copy CSV to _databases folder and create individual notes
-          const csvDestPath = join(databasesDir, csvInfo.fileName + '.csv');
+          const csvDestPath = join(databasesDir, csvInfo.resolvedDataviewCsvFileName || `${csvInfo.fileName}.csv`);
           await copyFile(csvInfo.path, csvDestPath);
 
           // Create individual notes from CSV rows
@@ -1064,8 +1196,10 @@ async function main() {
 
           // Generate Dataview index
           const indexMarkdown = generateDataviewIndex(csvInfo, targetDir, createdNotes);
-          const indexPath = join(targetDir, `${csvInfo.databaseName}_Index.md`);
+          const dataviewIndexFileName = csvInfo.resolvedRootIndexFileName || `${csvInfo.databaseName}_Index.md`;
+          const indexPath = join(targetDir, dataviewIndexFileName);
           await Bun.write(indexPath, indexMarkdown);
+          csvWikilinkMap.set(csvInfo.databaseName, dataviewIndexFileName);
 
           if (config.verbose) {
             console.log(`    ✓ Created ${createdNotes.length} notes and Dataview index for ${csvInfo.databaseName}`);
@@ -1073,7 +1207,7 @@ async function main() {
         } else {
           // Traditional mode: Create static table index
           const baseDir = dirname(csvInfo.path);
-          const dbDir = join(baseDir, csvInfo.databaseName);
+          const dbDir = join(baseDir, csvInfo.resolvedNotesDirName || csvInfo.databaseName);
 
           // Move individual MD files to _data subfolder if database directory exists
           try {
@@ -1090,19 +1224,6 @@ async function main() {
                   const sourcePath = join(dbDir, file);
                   const destPath = join(dataDir, file);
                   await rename(sourcePath, destPath);
-
-                  // Update frontmatter to include 'data' tag for Bases filtering
-                  const content = await Bun.file(destPath).text();
-                  const updatedContent = content.replace(
-                    /^(tags:\s*(?:\n\s*-\s*"[^"]*")*)/m,
-                    (match, tagBlock) => {
-                      if (match.includes('"data"')) return match; // Already has 'data' tag
-                      return tagBlock + '\n  - "data"';
-                    }
-                  );
-                  if (updatedContent !== content) {
-                    await Bun.write(destPath, updatedContent);
-                  }
                 }
               }
 
@@ -1116,7 +1237,7 @@ async function main() {
 
           // Keep only _all.csv and rename to {databaseName}.csv
           const currentFileName = basename(csvInfo.path);
-          const finalCsvPath = join(baseDir, `${csvInfo.databaseName}.csv`);
+          const finalCsvPath = join(baseDir, csvInfo.resolvedCsvFileName || `${csvInfo.databaseName}.csv`);
           let csvToUse = csvInfo.path;
 
           // Check if current file ends with _all.csv
@@ -1167,12 +1288,16 @@ async function main() {
             }
           }
 
+          csvInfo.path = finalCsvPath;
+
           // Generate index using SQL Seal or Dataview syntax based on config
           const indexMarkdown = config.sqlsealMode
             ? generateSqlSealIndex(csvInfo, targetDir)
             : generateDatabaseIndex(csvInfo, targetDir);
-          const indexPath = join(baseDir, `${csvInfo.databaseName}_Index.md`);
+          const defaultIndexFileName = csvInfo.resolvedIndexFileName || `${csvInfo.databaseName}_Index.md`;
+          const indexPath = join(baseDir, defaultIndexFileName);
           await Bun.write(indexPath, indexMarkdown);
+          csvWikilinkMap.set(csvInfo.databaseName, defaultIndexFileName);
 
           if (config.verbose) {
             console.log(`    ✓ Created ${config.sqlsealMode ? 'SQL Seal' : 'Dataview'} index for ${csvInfo.databaseName} (${csvInfo.rows.length} records)`);
@@ -1182,6 +1307,125 @@ async function main() {
         csvIndexesCreated++;
       } catch (error) {
         console.warn(chalk.yellow(`    ⚠ Failed to process ${csvInfo.databaseName}: ${error.message}`));
+      }
+    }
+
+    if (config.basesMode && rowMatchAbstained.length > 0) {
+      const reviewPath = join(targetDir, '_csv_row_match_review.json');
+      await Bun.write(reviewPath, JSON.stringify({
+        generatedAt: new Date().toISOString(),
+        total: rowMatchAbstained.length,
+        items: rowMatchAbstained
+      }, null, 2));
+      if (config.verbose) {
+        console.log(`    ⚠ Wrote ${rowMatchAbstained.length} abstained row-note candidate(s) to ${relative(targetDir, reviewPath)}`);
+      }
+    }
+
+    // Rewrite CSV wikilinks to point to actual output files (.base or _Index)
+    if (csvWikilinkMap.size > 0) {
+      const mdGlob = new Glob('**/*.md');
+      let csvLinksRewritten = 0;
+      for await (const mdPath of mdGlob.scan({ cwd: targetDir, absolute: true })) {
+        let content = await Bun.file(mdPath).text();
+        let changed = false;
+
+        const toSafeWikilink = (label) => {
+          const trimmed = String(label || '').trim();
+          if (!trimmed) return '';
+          if (!/[\[\]]/.test(trimmed)) return `[[${trimmed}]]`;
+          const escapedTarget = trimmed.replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+          return `[[${escapedTarget}|${trimmed}]]`;
+        };
+
+        const rewrittenEmptyLinks = content.replace(/\[\]\(([^)]+\.md)\)/g, (match, linkPath) => {
+          if (linkPath.startsWith('http://') || linkPath.startsWith('https://')) {
+            return match;
+          }
+          const decoded = decodeURIComponent(linkPath);
+          const cleanedMdName = cleanName(basename(decoded)).replace(/\.md$/, '');
+          if (!cleanedMdName) return match;
+          return `[[${cleanedMdName}]]`;
+        });
+        if (rewrittenEmptyLinks !== content) {
+          content = rewrittenEmptyLinks;
+          changed = true;
+        }
+
+        const rewrittenNotionMarkdownLinks = content.replace(/\[([^\]]+)\]\((https?:\/\/(?:www\.)?notion\.so(?:\/[^)\s]*)?)\)/gi, (match, label) => {
+          const cleanedLabel = stripNotionUrlFromTitle(String(label || '')).trim();
+          if (!cleanedLabel) return '';
+          return toSafeWikilink(cleanedLabel);
+        });
+        if (rewrittenNotionMarkdownLinks !== content) {
+          content = rewrittenNotionMarkdownLinks;
+          changed = true;
+        }
+
+        const rewrittenNotionParenthesized = content.replace(/\s*\(https?:\/\/(?:www\.)?notion\.so(?:\/[^)\s]*)?\)/gi, '');
+        if (rewrittenNotionParenthesized !== content) {
+          content = rewrittenNotionParenthesized;
+          changed = true;
+        }
+
+        const rewrittenNotionAutoLinks = content.replace(/<https?:\/\/(?:www\.)?notion\.so(?:\/[^>]*)?>/gi, '');
+        if (rewrittenNotionAutoLinks !== content) {
+          content = rewrittenNotionAutoLinks;
+          changed = true;
+        }
+
+        for (const [dbName, targetFileName] of csvWikilinkMap) {
+          const wikiTarget = targetFileName.endsWith('.md')
+            ? targetFileName.slice(0, -3)
+            : targetFileName;
+          const pattern = new RegExp(
+            `\\[\\[${dbName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\|[^\\]]*)?\\]\\]`,
+            'gi'
+          );
+          const replaced = content.replace(pattern, (match, alias) => {
+            if (alias) {
+              return `[[${wikiTarget}${alias}]]`;
+            }
+            return `[[${wikiTarget}]]`;
+          });
+          if (replaced !== content) {
+            content = replaced;
+            changed = true;
+            csvLinksRewritten++;
+          }
+        }
+        if (changed) {
+          await Bun.write(mdPath, content);
+        }
+      }
+      if (csvLinksRewritten > 0 && config.verbose) {
+        console.log(`    ✓ Rewritten ${csvLinksRewritten} CSV wikilinks to actual output files`);
+      }
+    }
+
+    if (config.basesMode) {
+      const reconciliation = findBasesReconciliationIssues(targetDir, csvFiles);
+      if (reconciliation.hasIssues) {
+        if (reconciliation.leftoverRawCsvPaths.length > 0) {
+          console.error(chalk.red(`    ✗ Bases reconciliation found ${reconciliation.leftoverRawCsvPaths.length} leftover raw CSV file(s):`));
+          reconciliation.leftoverRawCsvPaths.slice(0, 10).forEach((path) => {
+            console.error(chalk.red(`      - ${relative(targetDir, path)}`));
+          });
+          if (reconciliation.leftoverRawCsvPaths.length > 10) {
+            console.error(chalk.red(`      ... and ${reconciliation.leftoverRawCsvPaths.length - 10} more`));
+          }
+        }
+        if (reconciliation.missingBaseFiles.length > 0) {
+          console.error(chalk.red(`    ✗ Bases reconciliation found ${reconciliation.missingBaseFiles.length} missing .base file(s):`));
+          reconciliation.missingBaseFiles.slice(0, 10).forEach((path) => {
+            console.error(chalk.red(`      - ${relative(targetDir, path)}`));
+          });
+          if (reconciliation.missingBaseFiles.length > 10) {
+            console.error(chalk.red(`      ... and ${reconciliation.missingBaseFiles.length - 10} more`));
+          }
+        }
+
+        throw new Error('Bases reconciliation failed: migration ended in partial CSV finalize state');
       }
     }
 

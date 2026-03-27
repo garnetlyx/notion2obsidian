@@ -33,3 +33,6 @@ npm-debug.log*
 
 *reference*
 docs/SESSION_LOG.md
+security_best_practices_report.md
+tasks-raw-analysis/
+tasks-test-output/
