@@ -597,7 +597,7 @@ function buildNoteTargetsByName(noteObjectIdMap) {
   const noteTargetsByName = new Map();
   for (const targetInfo of noteObjectIdMap.values()) {
     addCsvRewriteTarget(noteTargetsByName, targetInfo.title, {
-      targetPath: `${targetInfo.wikiTarget}.md`,
+      targetPath: `${basename(targetInfo.relativePath)}`,
       relativeDir: normalizeRelativeDirPath(dirname(targetInfo.relativePath)),
       targetType: 'note',
       databaseName: targetInfo.title
