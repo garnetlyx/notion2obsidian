@@ -1,4 +1,5 @@
 import { describe, test, expect } from "bun:test";
+import { basename, dirname } from "node:path";
 
 // Test utility functions by extracting them inline for testing
 // In a production setup, these would be exported from notion2obsidian.js
@@ -56,10 +57,739 @@ describe("Notion ID Detection", () => {
   test("should detect valid 32-char hex ID", () => {
     expect(isHexString("abc123def456789012345678901234ab")).toBe(true);
   });
+});
 
-  test("should extract Notion ID from filename", () => {
-    expect(extractNotionId("Project Alpha abc123def456789012345678901234ab.md"))
-      .toBe("abc123def456789012345678901234ab");
+describe("marker-based wikilink rewriting", () => {
+  test("md marker pattern extracts display text and notionObjectId", () => {
+    const markerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__\]\]/gi;
+    const content = "See [[Untitled|__MD_11111111111111111111111111111111__]] for details.";
+    const matches = [...content.matchAll(markerPattern)];
+
+    expect(matches.length).toBe(1);
+    expect(matches[0][1]).toBe("Untitled");
+    expect(matches[0][2]).toBe("11111111111111111111111111111111");
+  });
+
+  test("marker pattern extracts dbName and notionObjectId", () => {
+    const markerPattern = /\[\[([^|\]]+)(?:\|__CSV_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    
+    const content = "See [[Tasks|__CSV_cb4727700fdf467784b57df8b3d71cc7__]] for details.";
+    const matches = [...content.matchAll(markerPattern)];
+    
+    expect(matches.length).toBe(1);
+    expect(matches[0][1]).toBe("Tasks");
+    expect(matches[0][2]).toBe("cb4727700fdf467784b57df8b3d71cc7");
+  });
+
+  test("marker pattern preserves plain wikilinks without markers", () => {
+    const markerPattern = /\[\[([^|\]]+)(?:\|__CSV_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    
+    const content = "See [[Tasks]] and [[Projects]] for details.";
+    const matches = [...content.matchAll(markerPattern)];
+    
+    expect(matches.length).toBe(2);
+    expect(matches[0][1]).toBe("Tasks");
+    expect(matches[0][2]).toBeUndefined();
+    expect(matches[1][1]).toBe("Projects");
+    expect(matches[1][2]).toBeUndefined();
+  });
+
+  test("marker replacement restores correct target based on objectId", async () => {
+    const csvObjectIdMap = new Map([
+      ["cb4727700fdf467784b57df8b3d71cc7", { targetPath: "Tasks [cb472770].base", relativeDir: "Project1", databaseName: "Tasks", targetType: "base" }],
+      ["8e36195ae5da463fa49c05c963c8433b", { targetPath: "Tasks [8e36195a].base", relativeDir: "Project1", databaseName: "Tasks", targetType: "base" }]
+    ]);
+
+    const content = "Check [[Tasks|__CSV_cb4727700fdf467784b57df8b3d71cc7__]] and [[Tasks|__CSV_8e36195ae5da463fa49c05c963c8433b__]]";
+    await import("node:path");
+
+    const markerPattern = /\[\[([^|\]]+)(?:\|__CSV_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    const result = content.replace(markerPattern, (match, dbName, notionObjectId) => {
+      if (notionObjectId) {
+        const targetInfo = csvObjectIdMap.get(notionObjectId);
+        if (targetInfo) {
+          const wikiTarget = targetInfo.targetPath.replace(/\.(md|base)$/, "");
+          return `[[${wikiTarget}|${dbName}]]`;
+        }
+        return `[[${dbName}]]`;
+      }
+      return match;
+    });
+
+    expect(result).toBe("Check [[Tasks [cb472770]|Tasks]] and [[Tasks [8e36195a]|Tasks]]");
+    expect(result).not.toContain("__CSV_");
+  });
+
+  test("parent page links to child-folder same-name databases restore to disambiguated bases", () => {
+    const csvObjectIdMap = new Map([
+      ["11111111111111111111111111111111", { targetPath: "Untitled [11111111].base", relativeDir: "store", databaseName: "Untitled", targetType: "base" }],
+      ["22222222222222222222222222222222", { targetPath: "Untitled [22222222].base", relativeDir: "store", databaseName: "Untitled", targetType: "base" }]
+    ]);
+
+    const content = [
+      "# Product",
+      "[[Untitled|__CSV_11111111111111111111111111111111__]]",
+      "",
+      "# Listing",
+      "[[Untitled|__CSV_22222222222222222222222222222222__]]"
+    ].join("\n");
+
+    const markerPattern = /\[\[([^|\]]+)(?:\|__CSV_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    const result = content.replace(markerPattern, (match, dbName, notionObjectId) => {
+      if (!notionObjectId) return match;
+      const targetInfo = csvObjectIdMap.get(notionObjectId);
+      if (!targetInfo) return `[[${dbName}]]`;
+      return `[[${targetInfo.targetPath.replace(/\.(md|base)$/, "")}|${dbName}]]`;
+    });
+
+    expect(result).toContain("[[Untitled [11111111]|Untitled]]");
+    expect(result).toContain("[[Untitled [22222222]|Untitled]]");
+    expect(result).not.toContain("__CSV_");
+  });
+
+  test("parent page links to child-folder single database restore to base target", () => {
+    const csvObjectIdMap = new Map([
+      ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", { targetPath: "Home views.base", relativeDir: "dashboard", databaseName: "Home views", targetType: "base" }]
+    ]);
+
+    const content = "[[Home views|__CSV_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa__]]";
+    const markerPattern = /\[\[([^|\]]+)(?:\|__CSV_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    const result = content.replace(markerPattern, (match, dbName, notionObjectId) => {
+      if (!notionObjectId) return match;
+      const targetInfo = csvObjectIdMap.get(notionObjectId);
+      if (!targetInfo) return `[[${dbName}]]`;
+      return `[[${targetInfo.targetPath.replace(/\.(md|base)$/, "")}|${dbName}]]`;
+    });
+
+    expect(result).toBe("[[Home views|Home views]]");
+    expect(result).not.toContain("__CSV_");
+  });
+
+  test("marker pattern also matches strong-emphasis variant after remark normalization", () => {
+    const markerPattern = /\[\[([^|\]]+)(?:\|(?:__|\*\*)CSV_([a-f0-9]{32})(?:__|\*\*)(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    const content = "[[Untitled|**CSV_11111111111111111111111111111111**]]";
+    const matches = [...content.matchAll(markerPattern)];
+
+    expect(matches.length).toBe(1);
+    expect(matches[0][1]).toBe("Untitled");
+    expect(matches[0][2]).toBe("11111111111111111111111111111111");
+  });
+
+  test("strong-emphasis marker variant restores exact target", () => {
+    const csvObjectIdMap = new Map([
+      ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", { targetPath: "Home views_Index.md", relativeDir: "dashboard", databaseName: "Home views", targetType: "index" }]
+    ]);
+
+    const markerPattern = /\[\[([^|\]]+)(?:\|(?:__|\*\*)CSV_([a-f0-9]{32})(?:__|\*\*)(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    const content = "[[Home views|**CSV_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa**]]";
+    const result = content.replace(markerPattern, (match, dbName, notionObjectId) => {
+      if (!notionObjectId) return match;
+      const targetInfo = csvObjectIdMap.get(notionObjectId);
+      if (!targetInfo) return `[[${dbName}]]`;
+      return `[[${targetInfo.targetPath.replace(/\.(md|base)$/, "")}|${dbName}]]`;
+    });
+
+    expect(result).toBe("[[Home views_Index|Home views]]");
+    expect(result).not.toContain("CSV_");
+  });
+
+  test("markers are cleaned when no matching objectId found", async () => {
+    const csvObjectIdMap = new Map();
+    
+    const content = "[[Tasks|__CSV_aaaa0000aaaa0000aaaa0000aaaa0000__]]";
+    const markerPattern = /\[\[([^|\]]+)(?:\|__CSV_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    await import("node:path");
+    const result = content.replace(markerPattern, (match, dbName, notionObjectId) => {
+      if (notionObjectId) {
+        const targetInfo = csvObjectIdMap.get(notionObjectId);
+        if (targetInfo) {
+          const wikiTarget = targetInfo.filename.replace(/\.(md|base)$/, "");
+          return `[[${wikiTarget}|${dbName}]]`;
+        }
+        return `[[${dbName}]]`;  // Clean marker, keep wikilink
+      }
+      return match;
+    });
+
+    expect(result).toBe("[[Tasks]]");
+    expect(result).not.toContain("__CSV_");
+  });
+
+  test("md marker replacement restores exact child note path by notion-id", () => {
+    const noteObjectIdMap = new Map([
+      ["11111111111111111111111111111111", { wikiTarget: "topic/Untitled", title: "Untitled" }],
+      ["22222222222222222222222222222222", { wikiTarget: "topic/Untitled-2", title: "Untitled-2" }]
+    ]);
+
+    const mdMarkerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__\]\]/gi;
+    const content = "[[Untitled|__MD_11111111111111111111111111111111__]]";
+    const result = content.replace(mdMarkerPattern, (match, displayText, notionObjectId) => {
+      const targetInfo = noteObjectIdMap.get(notionObjectId);
+      if (!targetInfo) return `[[${displayText}]]`;
+      if (displayText === targetInfo.title) {
+        return `[[${targetInfo.wikiTarget}]]`;
+      }
+      return `[[${targetInfo.wikiTarget}|${displayText}]]`;
+    });
+
+    expect(result).toBe("[[topic/Untitled]]");
+  });
+
+  test("missing marker target is preserved as plain wikilink and does not enter heuristic rewrite", async () => {
+    const csvTargetsByName = new Map([
+      ["tasks", [{ targetPath: "Tasks.base", relativeDir: "Projects", targetType: "base" }]]
+    ]);
+
+    const markerPattern = /\[\[([^|\]]+)(?:\|__CSV_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?)?\]\]/gi;
+    let content = "[[Tasks|__CSV_deadbeefdeadbeefdeadbeefdeadbeef__]]";
+    const keepPlainTokens = new Map();
+
+    content = content.replace(markerPattern, (match, dbName, notionObjectId) => {
+      if (!notionObjectId) return match;
+      const token = "__CSV_KEEP_PLAIN_0__";
+      keepPlainTokens.set(token, `[[${dbName}]]`);
+      return token;
+    });
+
+    const plainWikilinkPattern = /\[\[([^|\]]+)(\|[^\]]*)?\]\]/gi;
+    content = content.replace(plainWikilinkPattern, (match, linkTarget) => {
+      const candidates = csvTargetsByName.get(String(linkTarget).toLowerCase());
+      return candidates ? "[[WRONG]]" : match;
+    });
+
+    for (const [token, plainWikilink] of keepPlainTokens) {
+      content = content.replaceAll(token, plainWikilink);
+    }
+
+    expect(content).toBe("[[Tasks]]");
+  });
+
+  test("missing CSV inventory is recorded as missing-export-file with object identity", () => {
+    const csvObjectIdMap = new Map();
+    const csvWikilinkReview = [];
+
+    const resolveCsvMarkerLink = (dbName, notionObjectId, notePath, originalLinkText) => {
+      const targetInfo = csvObjectIdMap.get(notionObjectId);
+      if (targetInfo) {
+        return {
+          resolvedText: `[[${targetInfo.targetPath.replace(/\.(md|base)$/, "")}|${dbName}]]`,
+          exactRestored: true
+        };
+      }
+
+      csvWikilinkReview.push({
+        notePath,
+        originalLinkText,
+        linkClass: "marker",
+        databaseName: dbName,
+        objectId: notionObjectId,
+        reason: "missing-export-file",
+        chosenTarget: null,
+        candidates: []
+      });
+
+      return {
+        resolvedText: `[[${dbName}]]`,
+        exactRestored: false
+      };
+    };
+
+    const result = resolveCsvMarkerLink(
+      "My tasks",
+      "cccccccccccccccccccccccccccccccc",
+      "Workspace/home.md",
+      "[[My tasks|**CSV_cccccccccccccccccccccccccccccccc**]]"
+    );
+
+    expect(result).toEqual({
+      resolvedText: "[[My tasks]]",
+      exactRestored: false
+    });
+    expect(csvWikilinkReview).toEqual([
+      {
+        notePath: "Workspace/home.md",
+        originalLinkText: "[[My tasks|**CSV_cccccccccccccccccccccccccccccccc**]]",
+        linkClass: "marker",
+        databaseName: "My tasks",
+        objectId: "cccccccccccccccccccccccccccccccc",
+        reason: "missing-export-file",
+        chosenTarget: null,
+        candidates: []
+      }
+    ]);
+  });
+
+  test("missing CSV inventory restores from intended relative dir when a unique generated target exists", () => {
+    const csvObjectIdMap = new Map();
+    const csvTargetsByName = new Map([
+      ["schedule", [
+        { targetPath: "Schedule_Index.md", relativeDir: "Trips/Trip A", databaseName: "Schedule", targetType: "index" },
+        { targetPath: "Schedule_Index 2.md", relativeDir: "Trips/Trip B", databaseName: "Schedule", targetType: "index" }
+      ]]
+    ]);
+
+    const decodeCsvMarkerRelativeDir = (encodedRelativeDir) => {
+      if (!encodedRelativeDir) return null;
+      return Buffer.from(encodedRelativeDir, "base64url").toString("utf8");
+    };
+
+    const resolveMissingExportCsvLink = (dbName, encodedRelativeDir) => {
+      const candidates = csvTargetsByName.get(String(dbName || "").trim().toLowerCase()) || [];
+      const intendedRelativeDir = decodeCsvMarkerRelativeDir(encodedRelativeDir);
+      const exactDirCandidates = candidates.filter(candidate => candidate.relativeDir === intendedRelativeDir);
+      if (exactDirCandidates.length === 1) {
+        return { status: "matched", target: exactDirCandidates[0], candidates };
+      }
+      return {
+        status: candidates.length === 0 ? "missing-export-file" : "missing-export-file-ambiguous",
+        candidates
+      };
+    };
+
+    const resolveCsvMarkerLink = (dbName, notionObjectId, encodedRelativeDir) => {
+      const targetInfo = csvObjectIdMap.get(notionObjectId);
+      if (targetInfo) {
+        return {
+          resolvedText: `[[${targetInfo.targetPath.replace(/\.(md|base)$/, "")}|${dbName}]]`,
+          exactRestored: true
+        };
+      }
+
+      const missingExportResolution = resolveMissingExportCsvLink(dbName, encodedRelativeDir);
+      if (missingExportResolution.status === "matched") {
+        return {
+          resolvedText: `[[${missingExportResolution.target.targetPath.replace(/\.(md|base)$/, "")}|${dbName}]]`,
+          exactRestored: true
+        };
+      }
+
+      return {
+        resolvedText: `[[${dbName}]]`,
+        exactRestored: false
+      };
+    };
+
+    const intendedDir = Buffer.from("Trips/Trip A", "utf8").toString("base64url");
+    const result = resolveCsvMarkerLink(
+      "Schedule",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      intendedDir
+    );
+
+    expect(result).toEqual({
+      resolvedText: "[[Schedule_Index|Schedule]]",
+      exactRestored: true
+    });
+  });
+
+  test("missing CSV inventory restores directly to note when object id matches migrated note", () => {
+    const csvObjectIdMap = new Map();
+    const noteObjectIdMap = new Map([
+      ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", { wikiTarget: "Workspace/home/Untitled", title: "Untitled" }]
+    ]);
+
+    const resolveCsvMarkerLink = (dbName, notionObjectId) => {
+      const csvTargetInfo = csvObjectIdMap.get(notionObjectId);
+      if (csvTargetInfo) {
+        return {
+          resolvedText: `[[${csvTargetInfo.targetPath.replace(/\.(md|base)$/, "")}|${dbName}]]`,
+          exactRestored: true
+        };
+      }
+
+      const noteTargetInfo = noteObjectIdMap.get(String(notionObjectId || "").toLowerCase());
+      if (noteTargetInfo) {
+        return {
+          resolvedText: `[[${noteTargetInfo.wikiTarget}|${dbName}]]`,
+          exactRestored: true
+        };
+      }
+
+      return {
+        resolvedText: `[[${dbName}]]`,
+        exactRestored: false
+      };
+    };
+
+    const result = resolveCsvMarkerLink("Untitled", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+    expect(result).toEqual({
+      resolvedText: "[[Workspace/home/Untitled|Untitled]]",
+      exactRestored: true
+    });
+  });
+
+  test("missing CSV inventory remains reviewable when intended dir still has no unique target", () => {
+    const csvTargetsByName = new Map([
+      ["untitled", [
+        { targetPath: "Untitled_Index.md", relativeDir: "Workspace/home", databaseName: "Untitled", targetType: "index" },
+        { targetPath: "Untitled [cccccccc]_Index.md", relativeDir: "Workspace/home", databaseName: "Untitled", targetType: "index" }
+      ]]
+    ]);
+
+    const intendedDir = Buffer.from("Workspace/home", "utf8").toString("base64url");
+    const candidates = csvTargetsByName.get("untitled");
+    const exactDirCandidates = candidates.filter(candidate => candidate.relativeDir === Buffer.from(intendedDir, "base64url").toString("utf8"));
+
+    expect(exactDirCandidates).toHaveLength(2);
+  });
+
+  test("missing CSV inventory restores from intended subtree when there is a unique descendant target", () => {
+    const csvTargetsByName = new Map([
+      ["my tasks", [
+        { targetPath: "My tasks_Index.md", relativeDir: "Workspace/home/My tasks", databaseName: "My tasks", targetType: "index" },
+        { targetPath: "My tasks_Index 2.md", relativeDir: "Workspace/elsewhere/My tasks", databaseName: "My tasks", targetType: "index" }
+      ]]
+    ]);
+
+    const decodeCsvMarkerRelativeDir = (encodedRelativeDir) => {
+      if (!encodedRelativeDir) return null;
+      return Buffer.from(encodedRelativeDir, "base64url").toString("utf8");
+    };
+
+    const resolveMissingExportCsvLink = (dbName, encodedRelativeDir) => {
+      const candidates = csvTargetsByName.get(String(dbName || "").trim().toLowerCase()) || [];
+      const intendedRelativeDir = decodeCsvMarkerRelativeDir(encodedRelativeDir);
+      const exactDirCandidates = candidates.filter(candidate => candidate.relativeDir === intendedRelativeDir);
+      if (exactDirCandidates.length === 1) {
+        return { status: "matched", target: exactDirCandidates[0], candidates };
+      }
+      if (exactDirCandidates.length > 1) {
+        return { status: "missing-export-file-ambiguous", candidates: exactDirCandidates };
+      }
+      const descendantCandidates = candidates.filter(candidate => candidate.relativeDir.startsWith(`${intendedRelativeDir}/`));
+      if (descendantCandidates.length === 1) {
+        return { status: "matched", target: descendantCandidates[0], candidates };
+      }
+      if (descendantCandidates.length > 1) {
+        return { status: "missing-export-file-ambiguous", candidates: descendantCandidates };
+      }
+      return {
+        status: candidates.length === 0 ? "missing-export-file" : "missing-export-file-ambiguous",
+        candidates
+      };
+    };
+
+    const intendedDir = Buffer.from("Workspace/home", "utf8").toString("base64url");
+    const result = resolveMissingExportCsvLink("My tasks", intendedDir);
+
+    expect(result).toEqual({
+      status: "matched",
+      target: {
+        targetPath: "My tasks_Index.md",
+        relativeDir: "Workspace/home/My tasks",
+        databaseName: "My tasks",
+        targetType: "index"
+      },
+      candidates: csvTargetsByName.get("my tasks")
+    });
+  });
+
+  test("missing CSV inventory restores from intended subtree when there is a unique descendant note target", () => {
+    const noteTargetsByName = new Map([
+      ["untitled", [
+        { targetPath: "Workspace/home/Untitled.md", relativeDir: "Workspace/home", databaseName: "Untitled", targetType: "note" },
+        { targetPath: "Workspace/elsewhere/Untitled.md", relativeDir: "Workspace/elsewhere", databaseName: "Untitled", targetType: "note" }
+      ]]
+    ]);
+
+    const decodeCsvMarkerRelativeDir = (encodedRelativeDir) => {
+      if (!encodedRelativeDir) return null;
+      return Buffer.from(encodedRelativeDir, "base64url").toString("utf8");
+    };
+
+    const resolveMissingExportTargetInSubtree = (intendedRelativeDir, candidates) => {
+      const exactDirCandidates = candidates.filter(candidate => candidate.relativeDir === intendedRelativeDir);
+      if (exactDirCandidates.length === 1) {
+        return { status: "matched", target: exactDirCandidates[0], candidates };
+      }
+      if (exactDirCandidates.length > 1) {
+        return { status: "ambiguous", candidates: exactDirCandidates };
+      }
+      const descendantCandidates = candidates.filter(candidate => candidate.relativeDir.startsWith(`${intendedRelativeDir}/`) || candidate.relativeDir === intendedRelativeDir);
+      if (descendantCandidates.length === 1) {
+        return { status: "matched", target: descendantCandidates[0], candidates };
+      }
+      if (descendantCandidates.length > 1) {
+        return { status: "ambiguous", candidates: descendantCandidates };
+      }
+      return { status: "none", candidates };
+    };
+
+    const resolveMissingExportCsvLink = (dbName, encodedRelativeDir) => {
+      const intendedRelativeDir = decodeCsvMarkerRelativeDir(encodedRelativeDir);
+      const noteCandidates = noteTargetsByName.get(String(dbName || "").trim().toLowerCase()) || [];
+      const noteResolution = resolveMissingExportTargetInSubtree(intendedRelativeDir, noteCandidates);
+      if (noteResolution.status === "matched") {
+        return { status: "matched", target: noteResolution.target, candidates: noteCandidates };
+      }
+      return {
+        status: noteCandidates.length === 0 ? "missing-export-file" : "missing-export-file-ambiguous",
+        candidates: noteCandidates
+      };
+    };
+
+    const intendedDir = Buffer.from("Workspace/home", "utf8").toString("base64url");
+    const result = resolveMissingExportCsvLink("Untitled", intendedDir);
+
+    expect(result).toEqual({
+      status: "matched",
+      target: {
+        targetPath: "Workspace/home/Untitled.md",
+        relativeDir: "Workspace/home",
+        databaseName: "Untitled",
+        targetType: "note"
+      },
+      candidates: noteTargetsByName.get("untitled")
+    });
+  });
+
+  test("missing CSV inventory remains reviewable when intended subtree has multiple descendant targets", () => {
+    const csvTargetsByName = new Map([
+      ["untitled", [
+        { targetPath: "Untitled A_Index.md", relativeDir: "Workspace/home/child-a", databaseName: "Untitled", targetType: "index" },
+        { targetPath: "Untitled B_Index.md", relativeDir: "Workspace/home/child-b", databaseName: "Untitled", targetType: "index" }
+      ]]
+    ]);
+
+    const decodeCsvMarkerRelativeDir = (encodedRelativeDir) => {
+      if (!encodedRelativeDir) return null;
+      return Buffer.from(encodedRelativeDir, "base64url").toString("utf8");
+    };
+
+    const resolveMissingExportCsvLink = (dbName, encodedRelativeDir) => {
+      const candidates = csvTargetsByName.get(String(dbName || "").trim().toLowerCase()) || [];
+      const intendedRelativeDir = decodeCsvMarkerRelativeDir(encodedRelativeDir);
+      const exactDirCandidates = candidates.filter(candidate => candidate.relativeDir === intendedRelativeDir);
+      if (exactDirCandidates.length > 0) {
+        return { status: exactDirCandidates.length === 1 ? "matched" : "missing-export-file-ambiguous", candidates: exactDirCandidates };
+      }
+      const descendantCandidates = candidates.filter(candidate => candidate.relativeDir.startsWith(`${intendedRelativeDir}/`));
+      if (descendantCandidates.length > 1) {
+        return { status: "missing-export-file-ambiguous", candidates: descendantCandidates };
+      }
+      return {
+        status: candidates.length === 0 ? "missing-export-file" : "missing-export-file-ambiguous",
+        candidates
+      };
+    };
+
+    const intendedDir = Buffer.from("Workspace/home", "utf8").toString("base64url");
+    const result = resolveMissingExportCsvLink("Untitled", intendedDir);
+
+    expect(result.status).toBe("missing-export-file-ambiguous");
+    expect(result.candidates).toHaveLength(2);
+  });
+
+  test("plain CSV wikilinks still rewrite through legacy name-based mapping", () => {
+    const csvWikilinkMap = new Map([
+      ["Tasks", "Tasks_Index.md"]
+    ]);
+
+    let content = "See [[Tasks]] for details.";
+    for (const [dbName, targetFileName] of csvWikilinkMap) {
+      const wikiTarget = targetFileName.endsWith(".md")
+        ? targetFileName.slice(0, -3)
+        : targetFileName;
+      const pattern = new RegExp(`\\[\\[${dbName}(\\|[^\\]]*)?\\]\\]`, "gi");
+      content = content.replace(pattern, (match, alias) => alias ? `[[${wikiTarget}${alias}]]` : `[[${wikiTarget}]]`);
+    }
+
+    expect(content).toBe("See [[Tasks_Index]] for details.");
+  });
+
+  test("root-level database target uses ../ prefix when ambiguous with same-name subfolder target", () => {
+    function normalizeRelativeDirPath(relPath) {
+      if (!relPath || relPath === ".") return "";
+      return String(relPath).replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/^\/+|\/+$/g, "");
+    }
+
+    function csvQualifiedWikiTarget(relativeDir, targetPath, notePath, ambiguous) {
+      const bareName = targetPath.replace(/\.(md|base)$/, "");
+      if (!ambiguous) return bareName;
+      if (relativeDir) return `${relativeDir}/${bareName}`;
+      const noteDir = normalizeRelativeDirPath(dirname(String(notePath || "").replace(/\\/g, "/")));
+      if (!noteDir) return bareName;
+      const depth = noteDir.split("/").length;
+      if (depth === 1) return `../${bareName}`;
+      return `${Array(depth).fill("..").join("/")}/${bareName}`;
+    }
+
+    function isCsvNameAmbiguous(dbName, csvTargetsByName) {
+      const candidates = csvTargetsByName.get(String(dbName || "").trim().toLowerCase());
+      if (!candidates || candidates.length <= 1) return false;
+      const uniqueDirs = new Set(candidates.map(c => normalizeRelativeDirPath(c.relativeDir)));
+      return uniqueDirs.size > 1;
+    }
+
+    const csvTargetsByName = new Map([
+      ["tasks", [
+        { targetPath: "Tasks.base", relativeDir: "", databaseName: "Tasks", targetType: "base" },
+        { targetPath: "Tasks.base", relativeDir: "Projects", databaseName: "Tasks", targetType: "base" }
+      ]]
+    ]);
+
+    const csvObjectIdMap = new Map([
+      ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", { targetPath: "Tasks.base", relativeDir: "", databaseName: "Tasks", targetType: "base" }],
+      ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", { targetPath: "Tasks.base", relativeDir: "Projects", databaseName: "Tasks", targetType: "base" }]
+    ]);
+
+    const resolveCsvMarkerLink = (dbName, notionObjectId, notePath) => {
+      const targetInfo = csvObjectIdMap.get(notionObjectId);
+      if (targetInfo) {
+        const wikiTarget = csvQualifiedWikiTarget(targetInfo.relativeDir, targetInfo.targetPath, notePath, isCsvNameAmbiguous(dbName, csvTargetsByName));
+        return { resolvedText: `[[${wikiTarget}|${dbName}]]`, exactRestored: true };
+      }
+      return { resolvedText: `[[${dbName}]]`, exactRestored: false };
+    };
+
+    const resolveFromSubfolder = resolveCsvMarkerLink("Tasks", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Projects/SomeNote.md");
+    expect(resolveFromSubfolder.resolvedText).toBe("[[../Tasks|Tasks]]");
+    expect(resolveFromSubfolder.exactRestored).toBe(true);
+
+    const resolveFromDeepSubfolder = resolveCsvMarkerLink("Tasks", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Projects/Deep/Nested.md");
+    expect(resolveFromDeepSubfolder.resolvedText).toBe("[[../../Tasks|Tasks]]");
+    expect(resolveFromDeepSubfolder.exactRestored).toBe(true);
+
+    const resolveFromRoot = resolveCsvMarkerLink("Tasks", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "RootNote.md");
+    expect(resolveFromRoot.resolvedText).toBe("[[Tasks|Tasks]]");
+    expect(resolveFromRoot.exactRestored).toBe(true);
+
+    const resolveSubfolderTarget = resolveCsvMarkerLink("Tasks", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Projects/SomeNote.md");
+    expect(resolveSubfolderTarget.resolvedText).toBe("[[Projects/Tasks|Tasks]]");
+    expect(resolveSubfolderTarget.exactRestored).toBe(true);
+
+    expect(isCsvNameAmbiguous("Tasks", new Map([
+      ["tasks", [{ targetPath: "Tasks.base", relativeDir: "", databaseName: "Tasks", targetType: "base" }]]
+    ]))).toBe(false);
+
+    expect(isCsvNameAmbiguous("Tasks", new Map([
+      ["tasks", [
+        { targetPath: "Tasks.base", relativeDir: "Projects", databaseName: "Tasks", targetType: "base" },
+        { targetPath: "Tasks.base", relativeDir: "Projects", databaseName: "Tasks", targetType: "base" }
+      ]]
+    ]))).toBe(false);
+  });
+});
+
+describe("bases-mode plain wikilink candidate ranking", () => {
+  function normalizeRelativeDirPath(relPath) {
+    if (!relPath || relPath === ".") return "";
+    return String(relPath).replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/^\/+|\/+$/g, "");
+  }
+
+  function splitRelativeDir(relPath) {
+    const normalized = normalizeRelativeDirPath(relPath);
+    return normalized ? normalized.split("/") : [];
+  }
+
+  function isSegmentPrefix(prefix, value) {
+    if (prefix.length > value.length) return false;
+    return prefix.every((segment, index) => value[index] === segment);
+  }
+
+  function scoreCandidate(noteRelPath, candidateRelativeDir) {
+    const noteDir = normalizeRelativeDirPath(dirname(noteRelPath));
+    const noteSegments = splitRelativeDir(noteDir);
+    const candidateSegments = splitRelativeDir(candidateRelativeDir);
+    const noteBase = basename(noteRelPath, ".md").toLowerCase();
+    const candidateLeaf = basename(normalizeRelativeDirPath(candidateRelativeDir)).toLowerCase();
+
+    if (noteBase && candidateLeaf && noteBase === candidateLeaf) return { rank: -1, distance: 0 };
+
+    if (noteDir === normalizeRelativeDirPath(candidateRelativeDir)) return { rank: 0, distance: 0 };
+    if (isSegmentPrefix(noteSegments, candidateSegments)) return { rank: 1, distance: candidateSegments.length - noteSegments.length };
+    if (isSegmentPrefix(candidateSegments, noteSegments)) return { rank: 2, distance: noteSegments.length - candidateSegments.length };
+    return { rank: 3, distance: Number.POSITIVE_INFINITY };
+  }
+
+  function selectBest(noteRelPath, candidates) {
+    const scored = candidates.map(candidate => ({ ...candidate, ...scoreCandidate(noteRelPath, candidate.relativeDir) }));
+    const bestRank = Math.min(...scored.map(candidate => candidate.rank));
+    const bestRankCandidates = scored.filter(candidate => candidate.rank === bestRank);
+    if (bestRank === 3) {
+      return bestRankCandidates.length === 1 ? { status: "matched", target: bestRankCandidates[0] } : { status: "ambiguous" };
+    }
+    const bestDistance = Math.min(...bestRankCandidates.map(candidate => candidate.distance));
+    const bestDistanceCandidates = bestRankCandidates.filter(candidate => candidate.distance === bestDistance);
+    return bestDistanceCandidates.length === 1
+      ? { status: "matched", target: bestDistanceCandidates[0] }
+      : { status: "ambiguous" };
+  }
+
+  test("prefers child-directory database for parent page links", () => {
+    const result = selectBest("Private & Shared/Home.md", [
+      { targetPath: "Untitled [1af19f66].base", relativeDir: "Private & Shared/Home", targetType: "base" },
+      { targetPath: "Untitled [2bf29f77].base", relativeDir: "Elsewhere", targetType: "base" }
+    ]);
+
+    expect(result.status).toBe("matched");
+    expect(result.target.targetPath).toBe("Untitled [1af19f66].base");
+  });
+
+  test("prefers candidate whose directory basename matches the note basename", () => {
+    const result = selectBest("Trips/place-1.md", [
+      { targetPath: "Schedule_Index.md", relativeDir: "Trips/place-1", targetType: "index" },
+      { targetPath: "Schedule_Index 2.md", relativeDir: "Trips/place-2", targetType: "index" }
+    ]);
+
+    expect(result.status).toBe("matched");
+    expect(result.target.targetPath).toBe("Schedule_Index.md");
+  });
+
+  test("keeps plain link when same-rank same-distance candidates tie", () => {
+    const result = selectBest("Private & Shared/Personal Home/Career/store.md", [
+      { targetPath: "Untitled [1af19f66].base", relativeDir: "Private & Shared/Personal Home/Career/store", targetType: "base" },
+      { targetPath: "Untitled [2bf29f77].base", relativeDir: "Private & Shared/Personal Home/Career/store", targetType: "base" }
+    ]);
+
+    expect(result.status).toBe("ambiguous");
+  });
+});
+
+describe("bases mode output", () => {
+  test("processCsvDatabases resolves CSV properties and output names", async () => {
+    const { join } = await import("node:path");
+    const { rm, mkdir } = await import("node:fs/promises");
+    const { processCsvDatabases } = await import("./src/lib/csv.js");
+
+    const dir = join(process.cwd(), "test_bases_matched");
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir, { recursive: true });
+
+    // Create CSV with Notion ID
+    await Bun.write(join(dir, "Tasks 1234567890abcdef1234567890abcdef_all.csv"),
+      "Name,Status\nPage A,Open\nPage B,Closed\n");
+
+    const csvFiles = await processCsvDatabases(dir);
+    expect(csvFiles.length).toBe(1);
+    expect(csvFiles[0].databaseName).toBe("Tasks");
+    expect(csvFiles[0].notionObjectId).toBe("1234567890abcdef1234567890abcdef");
+    expect(csvFiles[0].resolvedBaseFileName).toBe("Tasks.base");
+    expect(csvFiles[0].resolvedRootIndexFileName).toBe("Tasks_Index.md");
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("processCsvDatabases extracts correct notionObjectId for _all variant", async () => {
+    const { join } = await import("node:path");
+    const { rm, mkdir } = await import("node:fs/promises");
+    const { processCsvDatabases } = await import("./src/lib/csv.js");
+
+    const dir = join(process.cwd(), "test_bases_notionid");
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir, { recursive: true });
+
+    await Bun.write(join(dir, "Projects 8e36195ae5da463fa49c05c963c8433b_all.csv"),
+      "Name,Status\nProject 1,Open\n");
+
+    const csvFiles = await processCsvDatabases(dir);
+    expect(csvFiles.length).toBe(1);
+    expect(csvFiles[0].databaseName).toBe("Projects");
+    expect(csvFiles[0].notionObjectId).toBe("8e36195ae5da463fa49c05c963c8433b");
+    expect(csvFiles[0].relativeDir).toBe(".");
+
+    await rm(dir, { recursive: true, force: true });
   });
 
   test("should return null for filename without Notion ID", () => {
@@ -485,7 +1215,7 @@ function generateFallbackFrontmatter(data) {
       lines.push(`${key}:`);
       value.forEach(item => {
         lines.push(`  - ${JSON.stringify(item)}`);
-      });
+    });
     } else {
       lines.push(`${key}: ${JSON.stringify(value)}`);
     }
@@ -502,6 +1232,108 @@ function validateFrontmatter(frontmatterString) {
     return false;
   }
 }
+
+describe("CSV object ID marker in link conversion", () => {
+  test("convertMarkdownLinkToWiki adds object ID marker for md link with Notion ID", async () => {
+    const { convertMarkdownLinkToWiki } = await import("./src/lib/links.js");
+
+    const result = convertMarkdownLinkToWiki(
+      "[Untitled](topic/Untitled%2011111111111111111111111111111111.md)",
+      new Map(),
+      "/some/path/topic.md",
+      "/some/path"
+    );
+    expect(result).toBe("[[Untitled|__MD_11111111111111111111111111111111__]]");
+  });
+
+  test("convertMarkdownLinkToWiki adds object ID marker for empty-label md link with Notion ID", async () => {
+    const { convertMarkdownLinkToWiki } = await import("./src/lib/links.js");
+
+    const result = convertMarkdownLinkToWiki(
+      "[](topic/Untitled%2011111111111111111111111111111111.md)",
+      new Map(),
+      "/some/path/topic.md",
+      "/some/path"
+    );
+    expect(result).toBe("[[Untitled|__MD_11111111111111111111111111111111__]]");
+  });
+
+  test("convertMarkdownLinkToWiki adds object ID marker for CSV with Notion ID", async () => {
+    const { convertMarkdownLinkToWiki } = await import("./src/lib/links.js");
+    
+    const result = convertMarkdownLinkToWiki(
+      "[Tasks](Tasks%20cb4727700fdf467784b57df8b3d71cc7_all.csv)",
+      new Map(),
+      "/some/path/note.md",
+      "/some/path"
+    );
+    expect(result).toBe("[[Tasks|__CSV_cb4727700fdf467784b57df8b3d71cc7__]]");
+  });
+
+  test("convertMarkdownLinkToWiki encodes intended relative dir for CSV marker when baseDir is known", async () => {
+    const { convertMarkdownLinkToWiki } = await import("./src/lib/links.js");
+
+    const result = convertMarkdownLinkToWiki(
+      "[Schedule](Trip%20A/Schedule%20aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.csv)",
+      new Map(),
+      "/vault/Trips/Trip A.md",
+      "/vault"
+    );
+    const expectedDir = Buffer.from("Trips/Trip A", "utf8").toString("base64url");
+    expect(result).toBe(`[[Schedule|__CSV_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa__~${expectedDir}]]`);
+  });
+
+  test("convertMarkdownLinkToWiki preserves plain wikilink for CSV without Notion ID", async () => {
+    const { convertMarkdownLinkToWiki } = await import("./src/lib/links.js");
+    
+    const result = convertMarkdownLinkToWiki(
+      "[Tasks](Tasks.csv)",
+      new Map(),
+      "/some/path/note.md"
+    );
+    expect(result).toBe("[[Tasks]]");
+    expect(result).not.toContain("__CSV_");
+  });
+});
+
+describe("row-directory scoring guards", () => {
+  test("heading and frontmatter title should only contribute one match per file", () => {
+    const rowTitleSet = new Set(["legittasktitle"]);
+    const entry = {
+      normalizedBase: "otherfile",
+      normalizedCleaned: "otherfile",
+      heading: "Legit task title",
+      frontmatterTitle: "Legit task title"
+    };
+
+    let matchCount = 0;
+    let entryMatched = false;
+
+    if (rowTitleSet.has(entry.normalizedBase) || rowTitleSet.has(entry.normalizedCleaned)) {
+      entryMatched = true;
+    }
+
+    if (!entryMatched && entry.heading) {
+      const normalizedHeading = normalizeTitle(entry.heading);
+      if (normalizedHeading && rowTitleSet.has(normalizedHeading)) {
+        entryMatched = true;
+      }
+    }
+
+    if (!entryMatched && entry.frontmatterTitle) {
+      const normalizedFmTitle = normalizeTitle(entry.frontmatterTitle);
+      if (normalizedFmTitle && rowTitleSet.has(normalizedFmTitle)) {
+        entryMatched = true;
+      }
+    }
+
+    if (entryMatched) {
+      matchCount++;
+    }
+
+    expect(matchCount).toBe(1);
+  });
+});
 
 describe("Gray-Matter Frontmatter Validation", () => {
   test("should detect valid frontmatter", () => {

@@ -1,5 +1,5 @@
-import { basename, dirname, extname, join, relative } from "node:path";
-import { cleanName } from "./utils.js";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { cleanName, extractNotionId } from "./utils.js";
 
 const KNOWN_EXTENSIONS = new Set([
   '.aac', '.amr', '.bin', '.csv', '.docx', '.gif', '.heic', '.html',
@@ -211,8 +211,8 @@ export function convertBacklinksProperty(value) {
   return { wikilinks: [], bodyLines: [], converted: value };
 }
 
-export function convertMarkdownLinkToWiki(link, fileMap, currentFilePath) {
-  const match = link.match(/\[([^\]]+)\]\(([^)]+)\)/);
+export function convertMarkdownLinkToWiki(link, fileMap, currentFilePath, baseDir = null) {
+  const match = link.match(/\[([^\]]*)\]\(([^)]+)\)/);
   if (!match) return link;
 
   const [fullMatch, linkText, linkPath] = match;
@@ -234,7 +234,27 @@ export function convertMarkdownLinkToWiki(link, fileMap, currentFilePath) {
 
     if (KNOWN_EXTENSIONS.has(ext)) {
       if (ext === '.csv') {
-        return `[[${decodeURIComponent(linkText).trim()}]]`;
+        const databaseName = decodeURIComponent(linkText).trim();
+        // Extract notionObjectId from CSV filename (32 hex chars before .csv)
+        const csvBasename = basename(decodedPath, '.csv');
+        const idMatch = csvBasename.match(/(?:\s|^)([0-9a-fA-F]{32})(?:_all)?$/);
+        const notionObjectId = idMatch ? idMatch[1].toLowerCase() : null;
+        if (notionObjectId) {
+          let encodedRelativeDir = '';
+          if (baseDir) {
+            const resolvedCsvPath = resolve(dirname(currentFilePath), decodedPath);
+            const intendedRelativeDir = relative(baseDir, dirname(resolvedCsvPath)).replace(/\\/g, '/');
+            const normalizedRelativeDir = intendedRelativeDir === '.' ? '' : intendedRelativeDir;
+            if (normalizedRelativeDir) {
+              encodedRelativeDir = Buffer.from(normalizedRelativeDir, 'utf8').toString('base64url');
+            }
+          }
+          const marker = `__CSV_${notionObjectId}__`;
+          return encodedRelativeDir
+            ? `[[${databaseName}|${marker}~${encodedRelativeDir}]]`
+            : `[[${databaseName}|${marker}]]`;
+        }
+        return `[[${databaseName}]]`;
       }
       const cleanedFilename = cleanName(targetFilename);
       const decodedLinkText = decodeURIComponent(linkText);
@@ -270,6 +290,14 @@ export function convertMarkdownLinkToWiki(link, fileMap, currentFilePath) {
 
   // Decode link text
   const decodedLinkText = decodeURIComponent(linkText);
+  const notionObjectId = extractNotionId(targetFilename)?.toLowerCase() || null;
+
+  if (notionObjectId) {
+    const marker = `__MD_${notionObjectId}__`;
+    const displayText = (decodedLinkText || cleanedName).trim();
+    if (!displayText) return link;
+    return `[[${displayText}|${marker}]]`;
+  }
 
   // Build wiki link with optional anchor
   const anchorPart = anchor ? `#${anchor}` : '';

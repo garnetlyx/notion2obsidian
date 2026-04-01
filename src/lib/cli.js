@@ -118,6 +118,7 @@ ${chalk.yellow('Options:')}
       --no-csv        Disable CSV database processing and index generation
       --dataview      Create individual MD files from CSV rows (default: keep CSV only)
       --sqlseal       Use SQL Seal query syntax instead of Dataview (default: Dataview)
+      --bases        Use Obsidian Bases format for CSV databases
   -V, --version       Show version number
   -h, --help          Show this help message
 

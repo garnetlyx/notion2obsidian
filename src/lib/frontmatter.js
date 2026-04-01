@@ -510,7 +510,7 @@ export async function processFileContent(filePath, metadata, fileMap, baseDir, d
   let linkCount = 0;
   newContent = replaceOutsideFrontmatter(newContent, (body) =>
     body.replace(PATTERNS.mdLink, (match) => {
-      const converted = convertMarkdownLinkToWiki(match, fileMap, filePath);
+      const converted = convertMarkdownLinkToWiki(match, fileMap, filePath, baseDir);
       if (converted !== match) {
         linkCount++;
       }

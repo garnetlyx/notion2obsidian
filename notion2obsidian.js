@@ -22,7 +22,8 @@ import {
   sanitizeFilename,
   shortenFilename,
   cleanName,
-  cleanDirName
+  cleanDirName,
+  skeletonsMatch
 } from "./src/lib/utils.js";
 import { MigrationStats } from "./src/lib/stats.js";
 import { parseArgs, getVersion, showVersion, showHelp } from "./src/lib/cli.js";
@@ -88,7 +89,7 @@ async function deriveNameFromHeading(filePath, cleanedName) {
   return `${headingTitle}.md`;
 }
 
-function buildMdDirectoryIndex(targetDir) {
+async function buildMdDirectoryIndex(targetDir) {
   const index = new Map();
   const mdGlob = new Glob('**/*.md');
   for (const relPath of mdGlob.scanSync(targetDir)) {
@@ -98,11 +99,46 @@ function buildMdDirectoryIndex(targetDir) {
     const cleaned = cleanName(`${base}.md`).replace(/\.md$/, '');
     const normalizedBase = normalizeTitle(base);
     const normalizedCleaned = normalizeTitle(cleaned);
-    const entry = { fullPath, normalizedBase, normalizedCleaned };
+    
+    let heading = null;
+    let frontmatterTitle = null;
+    
+    let content = '';
+    try {
+      content = readFileSync(fullPath, 'utf-8');
+      
+      // Extract first H1 heading
+      const headingMatch = content.match(/^#\s+(.+)$/m);
+      if (headingMatch) {
+        heading = headingMatch[1].trim() || null;
+      }
+      
+      // Extract frontmatter title
+      try {
+        const parsed = matter(content);
+        if (parsed.data && parsed.data.title) {
+          frontmatterTitle = String(parsed.data.title).trim() || null;
+        }
+      } catch { /* skip */ }
+    } catch { /* skip */ }
+    
+    const entry = { fullPath, normalizedBase, normalizedCleaned, heading, frontmatterTitle };
     if (!index.has(dir)) index.set(dir, []);
     index.get(dir).push(entry);
   }
   return index;
+}
+
+function matchesRowTitleSet(candidate, rowTitleSet) {
+  const normalizedCandidate = normalizeTitle(candidate);
+  if (!normalizedCandidate) return false;
+  if (rowTitleSet.has(normalizedCandidate)) return true;
+  for (const rowTitle of rowTitleSet) {
+    if (skeletonsMatch(normalizedCandidate, rowTitle)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function resolveDatabaseRowDirectory(csvInfo, mdDirectoryIndex, targetDir) {
@@ -124,7 +160,14 @@ function resolveDatabaseRowDirectory(csvInfo, mdDirectoryIndex, targetDir) {
   for (const [dir, entries] of mdDirectoryIndex.entries()) {
     let matchCount = 0;
     for (const entry of entries) {
-      if (rowTitleSet.has(entry.normalizedBase) || rowTitleSet.has(entry.normalizedCleaned)) {
+      const entryMatched = [
+        entry.normalizedBase,
+        entry.normalizedCleaned,
+        entry.heading,
+        entry.frontmatterTitle
+      ].some(candidate => candidate && matchesRowTitleSet(candidate, rowTitleSet));
+
+      if (entryMatched) {
         matchCount++;
       }
     }
@@ -166,6 +209,461 @@ function resolveDatabaseRowDirectory(csvInfo, mdDirectoryIndex, targetDir) {
   }
 
   return { type: 'matched', dir: best.dir, bestScore: best.matchCount, bestDir: best.dir };
+}
+
+function normalizeRelativeDirPath(relPath) {
+  if (!relPath || relPath === '.') return '';
+  return String(relPath).replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/^\/+|\/+$/g, '');
+}
+
+function splitRelativeDir(relPath) {
+  const normalized = normalizeRelativeDirPath(relPath);
+  return normalized ? normalized.split('/') : [];
+}
+
+function isSegmentPrefix(prefix, value) {
+  if (prefix.length > value.length) return false;
+  return prefix.every((segment, index) => value[index] === segment);
+}
+
+function scoreCsvTargetLocality(noteRelativePath, candidateRelativeDir) {
+  const noteDir = normalizeRelativeDirPath(dirname(noteRelativePath));
+  const noteSegments = splitRelativeDir(noteDir);
+  const candidateSegments = splitRelativeDir(candidateRelativeDir);
+  const normalizedNoteBase = normalizeTitle(basename(noteRelativePath, '.md'));
+  const normalizedCandidateLeaf = normalizeTitle(basename(normalizeRelativeDirPath(candidateRelativeDir)));
+
+  if (normalizedNoteBase && normalizedCandidateLeaf && normalizedNoteBase === normalizedCandidateLeaf) {
+    return { rank: -1, distance: 0, noteDir };
+  }
+
+  if (noteDir === normalizeRelativeDirPath(candidateRelativeDir)) {
+    return { rank: 0, distance: 0, noteDir };
+  }
+
+  if (isSegmentPrefix(noteSegments, candidateSegments)) {
+    return {
+      rank: 1,
+      distance: candidateSegments.length - noteSegments.length,
+      noteDir
+    };
+  }
+
+  if (isSegmentPrefix(candidateSegments, noteSegments)) {
+    return {
+      rank: 2,
+      distance: noteSegments.length - candidateSegments.length,
+      noteDir
+    };
+  }
+
+  return { rank: 3, distance: Number.POSITIVE_INFINITY, noteDir };
+}
+
+function selectBestCsvTargetForNote(noteRelativePath, candidates) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return { status: 'no-candidate', candidates: [] };
+  }
+
+  const scoredCandidates = candidates.map(candidate => ({
+    ...candidate,
+    ...scoreCsvTargetLocality(noteRelativePath, candidate.relativeDir)
+  }));
+
+  const bestRank = Math.min(...scoredCandidates.map(candidate => candidate.rank));
+  const bestRankCandidates = scoredCandidates.filter(candidate => candidate.rank === bestRank);
+
+  if (bestRank === 3) {
+    if (bestRankCandidates.length === 1) {
+      return { status: 'matched', target: bestRankCandidates[0], candidates: scoredCandidates };
+    }
+    return { status: 'ambiguous', candidates: scoredCandidates };
+  }
+
+  const bestDistance = Math.min(...bestRankCandidates.map(candidate => candidate.distance));
+  const bestCandidates = bestRankCandidates.filter(candidate => candidate.distance === bestDistance);
+
+  if (bestCandidates.length !== 1) {
+    return { status: 'ambiguous', candidates: scoredCandidates };
+  }
+
+  return { status: 'matched', target: bestCandidates[0], candidates: scoredCandidates };
+}
+
+function addCsvRewriteTarget(targetsByName, databaseName, targetInfo) {
+  const key = String(databaseName || '').toLowerCase();
+  if (!targetsByName.has(key)) targetsByName.set(key, []);
+  targetsByName.get(key).push(targetInfo);
+}
+
+function createCsvReviewEntry({
+  notePath,
+  originalLinkText,
+  linkClass,
+  databaseName = null,
+  objectId = null,
+  candidates = [],
+  chosenTarget = null,
+  reason
+}) {
+  return {
+    notePath,
+    originalLinkText,
+    linkClass,
+    databaseName,
+    objectId,
+    reason,
+    chosenTarget: chosenTarget ? {
+      targetPath: chosenTarget.targetPath,
+      targetType: chosenTarget.targetType
+    } : null,
+    candidates: candidates.map(candidate => ({
+      targetPath: candidate.targetPath,
+      targetType: candidate.targetType,
+      relativeDir: candidate.relativeDir
+    }))
+  };
+}
+
+const CSV_MARKER_TOKEN_PATTERN = '(?:__|\\*\\*)CSV_([a-f0-9]{32})(?:__|\\*\\*)(?:~([A-Za-z0-9_-]+))?';
+const MD_MARKER_TOKEN_PATTERN = '(?:__|\\*\\*)MD_([a-f0-9]{32})(?:__|\\*\\*)';
+
+function decodeCsvMarkerRelativeDir(encodedRelativeDir) {
+  if (!encodedRelativeDir) return null;
+  try {
+    const decoded = Buffer.from(encodedRelativeDir, 'base64url').toString('utf8').trim();
+    if (!decoded || decoded === '.') return '';
+    return decoded.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/^\/+|\/+$/g, '');
+  } catch {
+    return null;
+  }
+}
+
+function buildMissingCsvRecoveryContext(targetDir) {
+  const mdGlob = new Glob('**/*.md');
+  const subtreeMarkdownCount = new Map();
+
+  for (const mdRelPath of mdGlob.scanSync(targetDir)) {
+    let currentDir = normalizeRelativeDirPath(dirname(mdRelPath));
+    while (true) {
+      subtreeMarkdownCount.set(currentDir, (subtreeMarkdownCount.get(currentDir) || 0) + 1);
+      if (!currentDir) break;
+      const parentDir = normalizeRelativeDirPath(dirname(currentDir));
+      if (parentDir === currentDir) break;
+      currentDir = parentDir;
+    }
+  }
+
+  const childDirsByParent = new Map();
+  for (const dirRelPathRaw of getAllDirectoriesSync(targetDir)) {
+    const dirRelPath = normalizeRelativeDirPath(dirRelPathRaw);
+    const parentDir = normalizeRelativeDirPath(dirname(dirRelPath));
+    if (!childDirsByParent.has(parentDir)) childDirsByParent.set(parentDir, []);
+    childDirsByParent.get(parentDir).push({
+      relativeDir: dirRelPath,
+      dirName: basename(dirRelPath),
+      normalizedName: normalizeTitle(cleanDirName(basename(dirRelPath))),
+      hasMarkdown: (subtreeMarkdownCount.get(dirRelPath) || 0) > 0
+    });
+  }
+
+  return { childDirsByParent };
+}
+
+function getAllDirectoriesSync(rootDir) {
+  const dirs = [];
+  const stack = [''];
+  while (stack.length > 0) {
+    const currentRel = stack.pop();
+    const currentAbs = currentRel ? join(rootDir, currentRel) : rootDir;
+    for (const entry of readdirSync(currentAbs, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        const childRel = normalizeRelativeDirPath(join(currentRel, entry.name));
+        dirs.push(childRel);
+        stack.push(childRel);
+      }
+    }
+  }
+  return dirs;
+}
+
+function generateRecoveredDirectoryIndex(dbName, childDirAbs, targetDir, intendedRelativeDir) {
+  const noteGlob = new Glob('**/*.md');
+  const noteLinks = [];
+  for (const noteRelUnderChild of noteGlob.scanSync(childDirAbs)) {
+    const absoluteNotePath = join(childDirAbs, noteRelUnderChild);
+    const relativeToIntended = relative(join(targetDir, intendedRelativeDir), absoluteNotePath).replace(/\\/g, '/');
+    const wikiTarget = relativeToIntended.replace(/\.md$/, '');
+    const label = basename(noteRelUnderChild, '.md');
+    noteLinks.push(`- [[${wikiTarget}|${label}]]`);
+  }
+
+  let markdown = `# ${dbName}\n\n`;
+  markdown += `Recovered index for a database link whose CSV file was not present in the export.\n\n`;
+  if (noteLinks.length > 0) {
+    markdown += `## Notes\n\n${noteLinks.join('\n')}\n`;
+  } else {
+    markdown += `No child notes were found in the recovered directory.\n`;
+  }
+  return markdown;
+}
+
+async function materializeMissingCsvDirectoryTargets(targetDir, missingMarkerHints, csvTargetsByName, recoveryContext) {
+  const createdTargets = new Map();
+  let createdCount = 0;
+
+  for (const hint of missingMarkerHints) {
+    const intendedRelativeDir = decodeCsvMarkerRelativeDir(hint.encodedRelativeDir);
+    if (intendedRelativeDir == null) continue;
+
+    const dbKey = String(hint.databaseName || '').trim().toLowerCase();
+    const existingCandidates = csvTargetsByName.get(dbKey) || [];
+    const exactDirCandidates = existingCandidates.filter(candidate =>
+      normalizeRelativeDirPath(candidate.relativeDir) === normalizeRelativeDirPath(intendedRelativeDir)
+    );
+    if (exactDirCandidates.length > 0) continue;
+
+    const recoveryKey = `${normalizeRelativeDirPath(intendedRelativeDir)}::${dbKey}`;
+    if (createdTargets.has(recoveryKey)) {
+      continue;
+    }
+
+    const childDirCandidates = (recoveryContext.childDirsByParent.get(normalizeRelativeDirPath(intendedRelativeDir)) || [])
+      .filter(candidate => candidate.hasMarkdown && candidate.normalizedName === normalizeTitle(hint.databaseName));
+
+    if (childDirCandidates.length !== 1) continue;
+
+    const childDir = childDirCandidates[0];
+    const intendedAbsDir = join(targetDir, intendedRelativeDir);
+    let fileName = `${hint.databaseName}_Index.md`;
+    let counter = 2;
+    while (statSync(join(intendedAbsDir, fileName), { throwIfNoEntry: false })) {
+      fileName = `${hint.databaseName}_Index ${counter}.md`;
+      counter++;
+    }
+
+    const indexContent = generateRecoveredDirectoryIndex(
+      hint.databaseName,
+      join(targetDir, childDir.relativeDir),
+      targetDir,
+      intendedRelativeDir
+    );
+    await Bun.write(join(intendedAbsDir, fileName), indexContent);
+
+    const targetInfo = {
+      databaseName: hint.databaseName,
+      targetPath: fileName,
+      relativeDir: intendedRelativeDir,
+      targetType: 'index'
+    };
+    createdTargets.set(recoveryKey, targetInfo);
+    addCsvRewriteTarget(csvTargetsByName, hint.databaseName, targetInfo);
+    createdCount++;
+  }
+
+  return createdCount;
+}
+
+function resolveMissingExportCsvLink(dbName, encodedRelativeDir, csvTargetsByName, noteTargetsByName = new Map()) {
+  const csvCandidates = csvTargetsByName.get(String(dbName || '').trim().toLowerCase()) || [];
+  const noteCandidates = noteTargetsByName.get(String(dbName || '').trim().toLowerCase()) || [];
+  const intendedRelativeDir = decodeCsvMarkerRelativeDir(encodedRelativeDir);
+
+  if (!intendedRelativeDir) {
+    return {
+      status: csvCandidates.length + noteCandidates.length === 0 ? 'missing-export-file' : 'missing-export-file-ambiguous',
+      candidates: [...csvCandidates, ...noteCandidates]
+    };
+  }
+
+  const csvResolution = resolveMissingExportTargetInSubtree(intendedRelativeDir, csvCandidates);
+  if (csvResolution.status === 'matched') {
+    return { status: 'matched', target: csvResolution.target, candidates: csvCandidates };
+  }
+  if (csvResolution.status === 'ambiguous') {
+    return { status: 'missing-export-file-ambiguous', candidates: csvResolution.candidates };
+  }
+
+  const noteResolution = resolveMissingExportTargetInSubtree(intendedRelativeDir, noteCandidates);
+  if (noteResolution.status === 'matched') {
+    return { status: 'matched', target: noteResolution.target, candidates: noteCandidates };
+  }
+  if (noteResolution.status === 'ambiguous') {
+    return { status: 'missing-export-file-ambiguous', candidates: noteResolution.candidates };
+  }
+
+  return {
+    status: csvCandidates.length + noteCandidates.length === 0 ? 'missing-export-file' : 'missing-export-file-ambiguous',
+    candidates: [...csvCandidates, ...noteCandidates]
+  };
+}
+
+function csvQualifiedWikiTarget(relativeDir, targetPath, notePath, ambiguous) {
+  const bareName = targetPath.replace(/\.(md|base)$/, '');
+  if (!ambiguous) return bareName;
+  if (relativeDir) return `${relativeDir}/${bareName}`;
+  const noteDir = normalizeRelativeDirPath(dirname(String(notePath || '').replace(/\\/g, '/')));
+  if (!noteDir) return bareName;
+  const depth = noteDir.split('/').length;
+  if (depth === 1) return `../${bareName}`;
+  return `${Array(depth).fill('..').join('/')}/${bareName}`;
+}
+
+function isCsvNameAmbiguous(dbName, csvTargetsByName) {
+  const candidates = csvTargetsByName.get(String(dbName || '').trim().toLowerCase());
+  if (!candidates || candidates.length <= 1) return false;
+  const uniqueDirs = new Set(candidates.map(c => normalizeRelativeDirPath(c.relativeDir)));
+  return uniqueDirs.size > 1;
+}
+
+function resolveCsvMarkerLink(dbName, notionObjectId, encodedRelativeDir, csvObjectIdMap, noteObjectIdMap, csvTargetsByName, noteTargetsByName, csvWikilinkReview, notePath, originalLinkText) {
+  const targetInfo = csvObjectIdMap.get(notionObjectId);
+  if (targetInfo) {
+    const wikiTarget = csvQualifiedWikiTarget(targetInfo.relativeDir, targetInfo.targetPath, notePath, isCsvNameAmbiguous(dbName, csvTargetsByName));
+    return {
+      resolvedText: `[[${wikiTarget}|${dbName}]]`,
+      exactRestored: true
+    };
+  }
+
+  const noteTargetInfo = noteObjectIdMap.get(String(notionObjectId || '').toLowerCase());
+  if (noteTargetInfo) {
+    return {
+      resolvedText: `[[${noteTargetInfo.wikiTarget}|${dbName}]]`,
+      exactRestored: true
+    };
+  }
+
+  const missingExportResolution = resolveMissingExportCsvLink(dbName, encodedRelativeDir, csvTargetsByName, noteTargetsByName);
+  if (missingExportResolution.status === 'matched') {
+    const target = missingExportResolution.target;
+    const wikiTarget = csvQualifiedWikiTarget(target.relativeDir, target.targetPath, notePath, isCsvNameAmbiguous(dbName, csvTargetsByName));
+    return {
+      resolvedText: `[[${wikiTarget}|${dbName}]]`,
+      exactRestored: true
+    };
+  }
+
+  csvWikilinkReview.push(createCsvReviewEntry({
+    notePath,
+    originalLinkText,
+    linkClass: 'marker',
+    databaseName: dbName,
+    objectId: notionObjectId,
+    reason: missingExportResolution.status,
+    candidates: missingExportResolution.candidates
+  }));
+
+  return {
+    resolvedText: `[[${dbName}]]`,
+    exactRestored: false
+  };
+}
+
+function buildNoteObjectIdMap(targetDir) {
+  const noteObjectIdMap = new Map();
+  const mdGlob = new Glob('**/*.md');
+
+  for (const mdRelPathRaw of mdGlob.scanSync(targetDir)) {
+    const mdRelPath = mdRelPathRaw.replace(/\\/g, '/');
+    let content;
+    try {
+      content = readFileSync(join(targetDir, mdRelPath), 'utf8');
+    } catch {
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = matter(content);
+    } catch {
+      continue;
+    }
+
+    const notionId = String(parsed?.data?.['notion-id'] || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{32}$/.test(notionId)) continue;
+
+    noteObjectIdMap.set(notionId, {
+      relativePath: mdRelPath,
+      wikiTarget: mdRelPath.replace(/\.md$/, ''),
+      title: basename(mdRelPath, '.md')
+    });
+  }
+
+  return noteObjectIdMap;
+}
+
+function buildNoteTargetsByName(noteObjectIdMap) {
+  const noteTargetsByName = new Map();
+  for (const targetInfo of noteObjectIdMap.values()) {
+    addCsvRewriteTarget(noteTargetsByName, targetInfo.title, {
+      targetPath: `${targetInfo.wikiTarget}.md`,
+      relativeDir: normalizeRelativeDirPath(dirname(targetInfo.relativePath)),
+      targetType: 'note',
+      databaseName: targetInfo.title
+    });
+  }
+  return noteTargetsByName;
+}
+
+function resolveMissingExportTargetInSubtree(intendedRelativeDir, candidates) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return { status: 'none', candidates: [] };
+  }
+
+  const normalizedIntendedDir = normalizeRelativeDirPath(intendedRelativeDir);
+  if (!normalizedIntendedDir) {
+    return {
+      status: candidates.length === 1 ? 'matched' : 'ambiguous',
+      target: candidates.length === 1 ? candidates[0] : null,
+      candidates
+    };
+  }
+
+  const exactDirCandidates = candidates.filter(candidate =>
+    normalizeRelativeDirPath(candidate.relativeDir) === normalizedIntendedDir
+  );
+  if (exactDirCandidates.length === 1) {
+    return { status: 'matched', target: exactDirCandidates[0], candidates };
+  }
+  if (exactDirCandidates.length > 1) {
+    return { status: 'ambiguous', candidates: exactDirCandidates };
+  }
+
+  const descendantCandidates = candidates.filter((candidate) => {
+    const candidateDir = normalizeRelativeDirPath(candidate.relativeDir);
+    return candidateDir.startsWith(`${normalizedIntendedDir}/`);
+  });
+  if (descendantCandidates.length === 1) {
+    return { status: 'matched', target: descendantCandidates[0], candidates };
+  }
+  if (descendantCandidates.length > 1) {
+    return { status: 'ambiguous', candidates: descendantCandidates };
+  }
+
+  return { status: 'none', candidates };
+}
+
+function resolveMdMarkerLink(displayText, notionObjectId, noteObjectIdMap) {
+  const targetInfo = noteObjectIdMap.get(String(notionObjectId || '').toLowerCase());
+  if (!targetInfo) {
+    return {
+      resolvedText: `[[${displayText}]]`,
+      exactRestored: false
+    };
+  }
+
+  if (!displayText || displayText === targetInfo.title) {
+    return {
+      resolvedText: `[[${targetInfo.wikiTarget}]]`,
+      exactRestored: true
+    };
+  }
+
+  return {
+    resolvedText: `[[${targetInfo.wikiTarget}|${displayText}]]`,
+    exactRestored: true
+  };
 }
 
 // ============================================================================
@@ -499,6 +997,52 @@ async function main() {
     const encoded = encodeURIComponent(filename);
     const encodedEntry = fileMap.get(encoded);
     if (encodedEntry) encodedEntry.cleanedName = file.newName;
+  }
+
+  // Re-check for heading-derived collisions: deriveNameFromHeading() can cause
+  // two previously distinct files in the same directory to converge on the same
+  // cleanedName. Detect and suffix so that fileMap, frontmatter, and Step 4
+  // all agree on the final name.
+  {
+    const dirFiles = new Map();
+    for (let i = 0; i < fileMigrationMap.length; i++) {
+      const f = fileMigrationMap[i];
+      const dir = dirname(f.oldPath);
+      if (!dirFiles.has(dir)) dirFiles.set(dir, []);
+      dirFiles.get(dir).push({ index: i, newName: f.newName, oldName: f.oldName });
+    }
+    for (const [, entries] of dirFiles) {
+      const nameCount = new Map();
+      for (const e of entries) {
+        nameCount.set(e.newName, (nameCount.get(e.newName) || 0) + 1);
+      }
+      for (const e of entries) {
+        if (nameCount.get(e.newName) <= 1) continue;
+        const base = e.newName.replace(/\.md$/, '');
+        const ext = '.md';
+        let counter = 1;
+        let uniqueName = `${base}-${counter}${ext}`;
+        while (nameCount.has(uniqueName)) {
+          counter++;
+          uniqueName = `${base}-${counter}${ext}`;
+        }
+        nameCount.set(uniqueName, 1);
+        nameCount.set(e.newName, nameCount.get(e.newName) - 1);
+
+        const file = fileMigrationMap[e.index];
+        file.newName = uniqueName;
+        file.newPath = join(dirname(file.oldPath), uniqueName);
+        file.metadata.title = uniqueName.replace('.md', '');
+        if (file.needsRename || e.oldName !== uniqueName) file.needsRename = true;
+
+        const filename = basename(file.oldPath);
+        const entry = fileMap.get(filename);
+        if (entry) entry.cleanedName = uniqueName;
+        const encoded = encodeURIComponent(filename);
+        const encodedEntry = fileMap.get(encoded);
+        if (encodedEntry) encodedEntry.cleanedName = uniqueName;
+      }
+    }
   }
 
   // Process directories
@@ -1093,7 +1637,7 @@ async function main() {
     let totalNotesCreated = 0;
     let baseFilesCreated = 0;
     const rowMatchAbstained = [];
-    const mdDirectoryIndex = buildMdDirectoryIndex(targetDir);
+    const mdDirectoryIndex = await buildMdDirectoryIndex(targetDir);
     const globalExistingSkeletons = [];
     const seenSkeletons = new Set();
     for (const entries of mdDirectoryIndex.values()) {
@@ -1113,14 +1657,18 @@ async function main() {
       await mkdir(databasesDir, { recursive: true });
     }
 
-    // Map databaseName → actual wikilink target for post-processing rewrite
+    // Legacy name-based rewrite map for default/dataview flows.
     const csvWikilinkMap = new Map();
+    const csvTargetsByName = new Map(); // lower(databaseName) → [{ targetPath, relativeDir, targetType, ... }]
+    const csvObjectIdMap = new Map(); // notionObjectId → { targetPath, relativeDir, databaseName, targetType }
+    const csvWikilinkReview = [];
 
     for (const csvInfo of csvFiles) {
       try {
         if (config.basesMode) {
           const csvDir = dirname(csvInfo.path);
           const resolvedRowDir = resolveDatabaseRowDirectory(csvInfo, mdDirectoryIndex, targetDir);
+          csvInfo._resolvedType = resolvedRowDir.type;
           let dbDir = resolvedRowDir.dir;
 
           let enrichResult = { enriched: 0, skipped: 0 };
@@ -1175,15 +1723,50 @@ async function main() {
 
           csvInfo.path = cleanCsvPath;
 
-          const baseFileContent = generateBaseFile(csvInfo, targetDir, dbDir);
-          const baseFileName = csvInfo.resolvedBaseFileName || `${csvInfo.databaseName}.base`;
-          const basePath = join(csvDir, baseFileName);
-          await Bun.write(basePath, baseFileContent);
-          csvWikilinkMap.set(csvInfo.databaseName, baseFileName);
-          baseFilesCreated++;
+          if (resolvedRowDir.type === 'matched') {
+            // Matched: create .base file
+            const baseFileContent = generateBaseFile(csvInfo, targetDir, dbDir);
+            const baseFileName = csvInfo.resolvedBaseFileName || `${csvInfo.databaseName}.base`;
+            const basePath = join(csvDir, baseFileName);
+            await Bun.write(basePath, baseFileContent);
+            addCsvRewriteTarget(csvTargetsByName, csvInfo.databaseName, {
+              databaseName: csvInfo.databaseName,
+              targetPath: baseFileName,
+              relativeDir: csvInfo.relativeDir,
+              targetType: 'base'
+            });
+            baseFilesCreated++;
 
-          if (config.verbose) {
-            console.log(`    ✓ Created .base file for ${csvInfo.databaseName}`);
+            if (config.verbose) {
+              console.log(`    ✓ Created .base file for ${csvInfo.databaseName}`);
+            }
+          } else {
+            // Unmatched: create _Index.md fallback
+            const indexContent = generateDatabaseIndex(csvInfo, targetDir);
+            const indexFileName = csvInfo.resolvedRootIndexFileName || `${csvInfo.databaseName}_Index.md`;
+            const indexPath = join(csvDir, indexFileName);
+            await Bun.write(indexPath, indexContent);
+            addCsvRewriteTarget(csvTargetsByName, csvInfo.databaseName, {
+              databaseName: csvInfo.databaseName,
+              targetPath: indexFileName,
+              relativeDir: csvInfo.relativeDir,
+              targetType: 'index'
+            });
+
+            console.log(`    ⚠ Row directory not found for ${csvInfo.databaseName}, created ${indexFileName} fallback`);
+          }
+
+          // Build object ID map for precise wikilink restoration
+          if (csvInfo.notionObjectId) {
+            const outputFileName = resolvedRowDir.type === 'matched'
+              ? (csvInfo.resolvedBaseFileName || `${csvInfo.databaseName}.base`)
+              : (csvInfo.resolvedRootIndexFileName || `${csvInfo.databaseName}_Index.md`);
+            csvObjectIdMap.set(csvInfo.notionObjectId, {
+              targetPath: outputFileName,
+              relativeDir: csvInfo.relativeDir,
+              databaseName: csvInfo.databaseName,
+              targetType: resolvedRowDir.type === 'matched' ? 'base' : 'index'
+            });
           }
         } else if (config.dataviewMode) {
           // Dataview mode: Copy CSV to _databases folder and create individual notes
@@ -1322,13 +1905,41 @@ async function main() {
       }
     }
 
-    // Rewrite CSV wikilinks to point to actual output files (.base or _Index)
-    if (csvWikilinkMap.size > 0) {
+    if (config.basesMode) {
+      const markerPattern = new RegExp(`\\[\\[([^|\\]]+)(?:\\|${CSV_MARKER_TOKEN_PATTERN})?\\]\\]`, 'gi');
+      const missingMarkerHints = [];
+      const mdGlob = new Glob('**/*.md');
+      for await (const mdPath of mdGlob.scan({ cwd: targetDir, absolute: true })) {
+        const content = await Bun.file(mdPath).text();
+        for (const match of content.matchAll(markerPattern)) {
+          const databaseName = match[1];
+          const notionObjectId = match[2];
+          const encodedRelativeDir = match[3];
+          if (!notionObjectId || csvObjectIdMap.has(notionObjectId)) continue;
+          missingMarkerHints.push({ databaseName, notionObjectId, encodedRelativeDir });
+        }
+      }
+
+      if (missingMarkerHints.length > 0) {
+        const recoveryContext = buildMissingCsvRecoveryContext(targetDir);
+        await materializeMissingCsvDirectoryTargets(targetDir, missingMarkerHints, csvTargetsByName, recoveryContext);
+      }
+    }
+
+    const noteObjectIdMap = buildNoteObjectIdMap(targetDir);
+    const noteTargetsByName = buildNoteTargetsByName(noteObjectIdMap);
+
+    // Rewrite CSV and exact note wikilinks to point to actual output files
+    if (csvWikilinkMap.size > 0 || csvTargetsByName.size > 0 || csvObjectIdMap.size > 0 || noteObjectIdMap.size > 0) {
       const mdGlob = new Glob('**/*.md');
       let csvLinksRewritten = 0;
+      let exactMarkerRestores = 0;
+      let plainCsvRestores = 0;
+      let exactNoteRestores = 0;
       for await (const mdPath of mdGlob.scan({ cwd: targetDir, absolute: true })) {
         let content = await Bun.file(mdPath).text();
         let changed = false;
+        const mdRelPath = relative(targetDir, mdPath).replace(/\\/g, '/');
 
         const toSafeWikilink = (label) => {
           const trimmed = String(label || '').trim();
@@ -1342,10 +1953,8 @@ async function main() {
           if (linkPath.startsWith('http://') || linkPath.startsWith('https://')) {
             return match;
           }
-          const decoded = decodeURIComponent(linkPath);
-          const cleanedMdName = cleanName(basename(decoded)).replace(/\.md$/, '');
-          if (!cleanedMdName) return match;
-          return `[[${cleanedMdName}]]`;
+          const converted = convertMarkdownLinkToWiki(match, fileMap, mdPath, targetDir);
+          return converted === match ? match : converted;
         });
         if (rewrittenEmptyLinks !== content) {
           content = rewrittenEmptyLinks;
@@ -1374,37 +1983,176 @@ async function main() {
           changed = true;
         }
 
-        for (const [dbName, targetFileName] of csvWikilinkMap) {
-          const wikiTarget = targetFileName.endsWith('.md')
-            ? targetFileName.slice(0, -3)
-            : targetFileName;
-          const pattern = new RegExp(
-            `\\[\\[${dbName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\|[^\\]]*)?\\]\\]`,
-            'gi'
-          );
-          const replaced = content.replace(pattern, (match, alias) => {
-            if (alias) {
-              return `[[${wikiTarget}${alias}]]`;
+        const mdMarkerPattern = new RegExp(`\\[\\[([^|\\]]+)\\|${MD_MARKER_TOKEN_PATTERN}\\]\\]`, 'gi');
+        const replacedMdMarkers = content.replace(mdMarkerPattern, (match, displayText, notionObjectId) => {
+          const markerResolution = resolveMdMarkerLink(displayText, notionObjectId, noteObjectIdMap);
+          if (markerResolution.exactRestored) {
+            exactNoteRestores++;
+          }
+          return markerResolution.resolvedText;
+        });
+        if (replacedMdMarkers !== content) {
+          content = replacedMdMarkers;
+          changed = true;
+        }
+
+        if (config.basesMode) {
+          const keepPlainTokens = new Map();
+          let keepPlainTokenCounter = 0;
+          const markerPattern = new RegExp(`\\[\\[([^|\\]]+)(?:\\|${CSV_MARKER_TOKEN_PATTERN})?\\]\\]`, 'gi');
+          const replacedMarkers = content.replace(markerPattern, (match, dbName, notionObjectId, encodedRelativeDir) => {
+            if (notionObjectId) {
+              const markerResolution = resolveCsvMarkerLink(
+                dbName,
+                notionObjectId,
+                encodedRelativeDir,
+                csvObjectIdMap,
+                noteObjectIdMap,
+                csvTargetsByName,
+                noteTargetsByName,
+                csvWikilinkReview,
+                mdRelPath,
+                match
+              );
+              if (markerResolution.exactRestored) {
+                exactMarkerRestores++;
+                return markerResolution.resolvedText;
+              }
+              const token = `__CSV_KEEP_PLAIN_${keepPlainTokenCounter++}__`;
+              keepPlainTokens.set(token, markerResolution.resolvedText);
+              return token;
             }
-            return `[[${wikiTarget}]]`;
+            return match;
           });
-          if (replaced !== content) {
-            content = replaced;
+          if (replacedMarkers !== content) {
+            content = replacedMarkers;
             changed = true;
-            csvLinksRewritten++;
+          }
+
+          const plainWikilinkPattern = /\[\[([^|\]]+)(\|[^\]]*)?\]\]/gi;
+          const replacedPlainLinks = content.replace(plainWikilinkPattern, (match, linkTarget, alias = '') => {
+            const targetKey = String(linkTarget || '').trim().toLowerCase();
+            const candidates = csvTargetsByName.get(targetKey);
+            if (!candidates || candidates.length === 0) {
+              return match;
+            }
+
+            const resolution = selectBestCsvTargetForNote(mdRelPath, candidates);
+            if (resolution.status !== 'matched') {
+              csvWikilinkReview.push(createCsvReviewEntry({
+                notePath: mdRelPath,
+                originalLinkText: match,
+                linkClass: 'plain',
+                reason: resolution.status === 'no-candidate' ? 'no-candidate' : 'ambiguous',
+                candidates: resolution.candidates
+              }));
+              return match;
+            }
+
+            const target = resolution.target;
+            const ambiguous = candidates.length > 1 && new Set(candidates.map(c => normalizeRelativeDirPath(c.relativeDir))).size > 1;
+            const wikiTarget = csvQualifiedWikiTarget(target.relativeDir, target.targetPath, mdRelPath, ambiguous);
+            plainCsvRestores++;
+            return alias
+              ? `[[${wikiTarget}${alias}]]`
+              : `[[${wikiTarget}]]`;
+          });
+          if (replacedPlainLinks !== content) {
+            content = replacedPlainLinks;
+            changed = true;
+          }
+
+          for (const [token, plainWikilink] of keepPlainTokens) {
+            if (content.includes(token)) {
+              content = content.replaceAll(token, plainWikilink);
+              changed = true;
+            }
+          }
+
+          const leakedMarkerPattern = new RegExp(`\\[\\[([^|\\]]+)\\|${CSV_MARKER_TOKEN_PATTERN}\\]\\]`, 'gi');
+          const cleanedLeakedMarkers = content.replace(leakedMarkerPattern, (match, dbName, notionObjectId, encodedRelativeDir) => {
+            const markerResolution = resolveCsvMarkerLink(
+              dbName,
+              notionObjectId,
+              encodedRelativeDir,
+              csvObjectIdMap,
+              noteObjectIdMap,
+              csvTargetsByName,
+              noteTargetsByName,
+              csvWikilinkReview,
+              mdRelPath,
+              match
+            );
+            if (markerResolution.exactRestored) {
+              exactMarkerRestores++;
+            }
+            return markerResolution.resolvedText;
+          });
+          if (cleanedLeakedMarkers !== content) {
+            content = cleanedLeakedMarkers;
+            changed = true;
+          }
+        } else {
+          // Keep the legacy name-based rewrite path for default/dataview flows.
+          for (const [dbName, targetFileName] of csvWikilinkMap) {
+            const wikiTarget = targetFileName.endsWith('.md')
+              ? targetFileName.slice(0, -3)
+              : targetFileName;
+            const pattern = new RegExp(
+              `\\[\\[${dbName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\|[^\\]]*)?\\]\\]`,
+              'gi'
+            );
+            const replacedByName = content.replace(pattern, (match, alias) => {
+              if (alias) {
+                return `[[${wikiTarget}${alias}]]`;
+              }
+              return `[[${wikiTarget}]]`;
+            });
+            if (replacedByName !== content) {
+              content = replacedByName;
+              changed = true;
+              csvLinksRewritten++;
+            }
           }
         }
         if (changed) {
           await Bun.write(mdPath, content);
         }
       }
+      if (config.basesMode) {
+        csvLinksRewritten = exactMarkerRestores + plainCsvRestores;
+      }
       if (csvLinksRewritten > 0 && config.verbose) {
-        console.log(`    ✓ Rewritten ${csvLinksRewritten} CSV wikilinks to actual output files`);
+        console.log(`    ✓ Rewritten ${csvLinksRewritten} CSV database wikilinks`);
+      }
+      if (config.basesMode && config.verbose) {
+        if (exactMarkerRestores > 0) {
+          console.log(`    ✓ Restored ${exactMarkerRestores} exact CSV wikilink(s) by object ID`);
+        }
+        if (plainCsvRestores > 0) {
+          console.log(`    ✓ Restored ${plainCsvRestores} plain CSV wikilink(s) by locality`);
+        }
+      }
+      if (exactNoteRestores > 0 && config.verbose) {
+        console.log(`    ✓ Restored ${exactNoteRestores} exact note wikilink(s) by notion-id`);
       }
     }
 
-    if (config.basesMode) {
-      const reconciliation = findBasesReconciliationIssues(targetDir, csvFiles);
+    if (config.basesMode && csvWikilinkReview.length > 0) {
+      const reviewPath = join(targetDir, '_csv_wikilink_review.json');
+      await Bun.write(reviewPath, JSON.stringify({
+        generatedAt: new Date().toISOString(),
+        total: csvWikilinkReview.length,
+        items: csvWikilinkReview
+      }, null, 2));
+      if (config.verbose) {
+        console.log(`    ⚠ Wrote ${csvWikilinkReview.length} CSV wikilink review item(s) to ${relative(targetDir, reviewPath)}`);
+      }
+    }
+
+     if (config.basesMode) {
+       const matchedCsvFiles = csvFiles.filter(csv => csv._resolvedType === 'matched');
+       const reconciliation = findBasesReconciliationIssues(targetDir, matchedCsvFiles);
       if (reconciliation.hasIssues) {
         if (reconciliation.leftoverRawCsvPaths.length > 0) {
           console.error(chalk.red(`    ✗ Bases reconciliation found ${reconciliation.leftoverRawCsvPaths.length} leftover raw CSV file(s):`));

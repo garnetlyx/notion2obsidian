@@ -6,7 +6,7 @@ import { extname } from "node:path";
 
 export const PATTERNS = {
   hexId: /^[0-9a-fA-F]{32}$/,
-  mdLink: /\[([^\]]+)\]\(([^)]+)\)/g,
+  mdLink: /\[([^\]]*)\]\(([^)]+)\)/g,
   frontmatter: /^\uFEFF?\s*---\s*\n/,  // Only accept --- delimiters (Obsidian requirement)
   notionIdExtract: /\s([0-9a-fA-F]{32})(?:\.[^.]+)?$/,
   // Visual patterns for Notion callouts

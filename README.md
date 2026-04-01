@@ -284,6 +284,24 @@ SELECT COUNT(*) as total FROM tasks
 - More powerful query capabilities (JOINs, CTEs, aggregations)
 - Parameterized queries using note properties
 
+#### Alternative: Bases Mode (`--bases`)
+
+For users who prefer a visual database view, use the `--bases` flag to create [Obsidian Bases](https://github.com/obsidian-bases/obsidian-bases) `.base` view files from your CSV databases:
+
+```bash
+notion2obsidian ./Export-abc123.zip ~/Vault --bases
+```
+
+**Key behaviors:**
+- Creates `.base` files for CSV databases where corresponding row directories are found
+- Falls back to `_Index.md` with Dataview query when the row directory cannot be matched
+- Automatically disambiguates same-name databases (e.g., `Tasks [abc12345].base`)
+- Enriches existing notes with CSV properties from the export
+- Generates missing row notes from CSV data when they don't exist
+- Requires the [Obsidian Bases plugin](https://github.com/obsidian-bases/obsidian-bases)
+
+**Note:** If the tool can't find the directory containing database row pages, it creates a `_Index.md` fallback instead of a `.base` file to prevent scope pollution in your Bases plugin.
+
 ## 🔮 Notion API Enrichment
 
 After migrating your Notion export, you can enrich your vault with additional metadata from the Notion API. This adds information that's not included in standard exports.

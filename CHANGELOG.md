@@ -9,6 +9,21 @@ published: false
 
 All notable changes to the Notion to Obsidian Migration Tool.
 
+## [Unreleased] - Bases Mode Bugfixes
+
+### 🐛 Bug Fixes
+- **Prevent scope pollution**: `.base` files are no longer created when row directory cannot be matched; `_Index.md` fallback with Dataview query is generated instead
+- **Fix wikilink collision**: CSV wikilink rewriting now uses object ID markers for precise occurrence-level restoration instead of global database name matching, preventing cross-wiring between same-name databases in different directories
+- **Improve row matching**: Enhanced directory index includes heading and frontmatter data; matching now uses fuzzy skeleton comparison for truncated filenames
+
+### ✨ Improvements
+- **Same-directory collision handling**: Multiple databases with the same name in the same directory are automatically disambiguated (e.g., `Tasks [abc12345].base`)
+- **Subtree-scoped rewriting**: Wikilink restoration only applies within the CSV's directory subtree, preventing accidental cross-directory linking
+
+### 📝 Documentation
+- Added `--bases` flag to CLI help text
+- Added Bases mode section to README
+
 ## [2.6.0] - 2025-10-15 - SQL Seal Support
 
 ### ✨ New Features
