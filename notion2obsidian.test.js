@@ -670,6 +670,71 @@ describe("marker-based wikilink rewriting", () => {
       ]]
     ]))).toBe(false);
   });
+
+  test("note target stored with bare filename is not double-prefixed with relativeDir", () => {
+    function normalizeRelativeDirPath(relPath) {
+      if (!relPath || relPath === ".") return "";
+      return String(relPath).replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/^\/+|\/+$/g, "");
+    }
+
+    function csvQualifiedWikiTarget(relativeDir, targetPath, notePath, ambiguous) {
+      const bareName = targetPath.replace(/\.(md|base)$/, "");
+      if (!ambiguous) return bareName;
+      if (relativeDir) return `${relativeDir}/${bareName}`;
+      const noteDir = normalizeRelativeDirPath(dirname(String(notePath || "").replace(/\\/g, "/")));
+      if (!noteDir) return bareName;
+      const depth = noteDir.split("/").length;
+      if (depth === 1) return `../${bareName}`;
+      return `${Array(depth).fill("..").join("/")}/${bareName}`;
+    }
+
+    function buildNoteTargetsByName(noteObjectIdMap) {
+      const noteTargetsByName = new Map();
+      for (const targetInfo of noteObjectIdMap.values()) {
+        const key = String(targetInfo.title || "").toLowerCase();
+        if (!noteTargetsByName.has(key)) noteTargetsByName.set(key, []);
+        noteTargetsByName.get(key).push({
+          targetPath: basename(targetInfo.relativePath),
+          relativeDir: normalizeRelativeDirPath(dirname(targetInfo.relativePath)),
+          targetType: "note",
+          databaseName: targetInfo.title
+        });
+      }
+      return noteTargetsByName;
+    }
+
+    function isCsvNameAmbiguous(dbName, csvTargetsByName, noteTargetsByName) {
+      const csvCandidates = csvTargetsByName.get(String(dbName || "").trim().toLowerCase()) || [];
+      const noteCandidates = noteTargetsByName.get(String(dbName || "").trim().toLowerCase()) || [];
+      const allCandidates = [...csvCandidates, ...noteCandidates];
+      if (allCandidates.length <= 1) return false;
+      const uniqueDirs = new Set(allCandidates.map(c => normalizeRelativeDirPath(c.relativeDir)));
+      return uniqueDirs.size > 1;
+    }
+
+    const noteObjectIdMap = new Map([
+      ["aaaa0000aaaa0000aaaa0000aaaa0000", { relativePath: "Workspace/dashboard/Untitled.md", wikiTarget: "Workspace/dashboard/Untitled", title: "Untitled" }],
+      ["bbbb0000bbbb0000bbbb0000bbbb0000", { relativePath: "Workspace/other/Untitled.md", wikiTarget: "Workspace/other/Untitled", title: "Untitled" }]
+    ]);
+
+    const noteTargetsByName = buildNoteTargetsByName(noteObjectIdMap);
+
+    const noteEntries = noteTargetsByName.get("untitled");
+    expect(noteEntries).toHaveLength(2);
+    expect(noteEntries[0].targetPath).toBe("Untitled.md");
+    expect(noteEntries[0].relativeDir).toBe("Workspace/dashboard");
+    expect(noteEntries[1].targetPath).toBe("Untitled.md");
+    expect(noteEntries[1].relativeDir).toBe("Workspace/other");
+
+    const csvResult = csvQualifiedWikiTarget("Workspace/dashboard", "Untitled.md", "Workspace/dashboard.md", true);
+    expect(csvResult).toBe("Workspace/dashboard/Untitled");
+
+    const rootResult = csvQualifiedWikiTarget("", "Untitled.md", "Workspace/dashboard/SomeNote.md", true);
+    expect(rootResult).toBe("../../Untitled");
+
+    const bareResult = csvQualifiedWikiTarget("Workspace/dashboard", "Untitled.md", "Workspace/dashboard.md", false);
+    expect(bareResult).toBe("Untitled");
+  });
 });
 
 describe("bases-mode plain wikilink candidate ranking", () => {
