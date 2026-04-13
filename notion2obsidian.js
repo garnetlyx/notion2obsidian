@@ -326,7 +326,7 @@ function createCsvReviewEntry({
 }
 
 const CSV_MARKER_TOKEN_PATTERN = '(?:__|\\*\\*)CSV_([a-f0-9]{32})(?:__|\\*\\*)(?:~([A-Za-z0-9_-]+))?';
-const MD_MARKER_TOKEN_PATTERN = '(?:__|\\*\\*)MD_([a-f0-9]{32})(?:__|\\*\\*)';
+const MD_MARKER_TOKEN_PATTERN = '(?:__|\\*\\*)MD_([a-f0-9]{32})(?:__|\\*\\*)(?:~([A-Za-z0-9_-]+))?';
 
 function decodeCsvMarkerRelativeDir(encodedRelativeDir) {
   if (!encodedRelativeDir) return null;
@@ -644,24 +644,41 @@ function resolveMissingExportTargetInSubtree(intendedRelativeDir, candidates) {
   return { status: 'none', candidates };
 }
 
-function resolveMdMarkerLink(displayText, notionObjectId, noteObjectIdMap) {
+function decodeMarkerAnchor(encodedAnchor) {
+  if (!encodedAnchor) return '';
+  try {
+    return Buffer.from(encodedAnchor, 'base64url').toString('utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+function appendAnchorToWikiTarget(wikiTarget, anchor) {
+  const normalizedAnchor = String(anchor || '').trim();
+  return normalizedAnchor ? `${wikiTarget}#${normalizedAnchor}` : wikiTarget;
+}
+
+function resolveMdMarkerLink(displayText, notionObjectId, encodedAnchor, noteObjectIdMap) {
+  const anchor = decodeMarkerAnchor(encodedAnchor);
   const targetInfo = noteObjectIdMap.get(String(notionObjectId || '').toLowerCase());
   if (!targetInfo) {
     return {
-      resolvedText: `[[${displayText}]]`,
+      resolvedText: `[[${appendAnchorToWikiTarget(displayText, anchor)}]]`,
       exactRestored: false
     };
   }
 
+  const targetWithAnchor = appendAnchorToWikiTarget(targetInfo.wikiTarget, anchor);
+
   if (!displayText || displayText === targetInfo.title) {
     return {
-      resolvedText: `[[${targetInfo.wikiTarget}]]`,
+      resolvedText: `[[${targetWithAnchor}]]`,
       exactRestored: true
     };
   }
 
   return {
-    resolvedText: `[[${targetInfo.wikiTarget}|${displayText}]]`,
+    resolvedText: `[[${targetWithAnchor}|${displayText}]]`,
     exactRestored: true
   };
 }
@@ -1118,7 +1135,9 @@ async function main() {
   const sampleSize = Math.min(10, fileMigrationMap.length);
   for (let i = 0; i < sampleSize; i++) {
     const sample = fileMigrationMap[i];
-    const { linkCount } = await processFileContent(sample.oldPath, sample.metadata, fileMap, targetDir, dirNameMap);
+    const { linkCount } = await processFileContent(sample.oldPath, sample.metadata, fileMap, targetDir, dirNameMap, {
+      inferMetadata: config.inferMetadata
+    });
     estimatedLinkCount += linkCount;
   }
   const avgLinksPerFile = sampleSize > 0 ? estimatedLinkCount / sampleSize : 0;
@@ -1165,7 +1184,9 @@ async function main() {
 
     const results = await Promise.all(
       batch.map(file => {
-        return updateFileContent(file.oldPath, file.metadata, fileMap, targetDir, dirNameMap);
+        return updateFileContent(file.oldPath, file.metadata, fileMap, targetDir, dirNameMap, {
+          inferMetadata: config.inferMetadata
+        });
       })
     );
 
@@ -1984,8 +2005,8 @@ async function main() {
         }
 
         const mdMarkerPattern = new RegExp(`\\[\\[([^|\\]]+)\\|${MD_MARKER_TOKEN_PATTERN}\\]\\]`, 'gi');
-        const replacedMdMarkers = content.replace(mdMarkerPattern, (match, displayText, notionObjectId) => {
-          const markerResolution = resolveMdMarkerLink(displayText, notionObjectId, noteObjectIdMap);
+        const replacedMdMarkers = content.replace(mdMarkerPattern, (match, displayText, notionObjectId, encodedAnchor) => {
+          const markerResolution = resolveMdMarkerLink(displayText, notionObjectId, encodedAnchor, noteObjectIdMap);
           if (markerResolution.exactRestored) {
             exactNoteRestores++;
           }

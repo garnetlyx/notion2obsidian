@@ -9,7 +9,38 @@ import { convertPropertyRelations, convertBacklinksProperty, buildPageNameSet, c
 // Metadata Extraction
 // ============================================================================
 
-export function extractInlineMetadataFromLines(lines) {
+function isRecognizedInlineMetadataKey(line) {
+  return line.startsWith('Status:') ||
+    line.startsWith('Owner:') ||
+    line.startsWith('Dates:') ||
+    line.startsWith('Priority:') ||
+    line.startsWith('Completion:') ||
+    line.startsWith('Summary:');
+}
+
+function extractGenericInlineProperty(lines, index) {
+  const line = lines[index];
+  const match = line.match(/^([^:#!\[\]*\->`•│├└\n\r][^:\n\r]*):\s*(.+)$/);
+  if (!match) return null;
+
+  const key = sanitizeKey(match[1]);
+  let value = match[2].trim();
+  const continuationIndices = [];
+
+  let j = index + 1;
+  while (j < lines.length && (lines[j].startsWith('- ') || lines[j].startsWith('* '))) {
+    value += '\n' + lines[j];
+    continuationIndices.push(j);
+    j++;
+  }
+
+  if (!key || !value) return null;
+
+  return { key, value, continuationIndices };
+}
+
+export function extractInlineMetadataFromLines(lines, options = {}) {
+  const { inferMetadata = false } = options;
   const metadata = {};
   const matchedIndices = new Set();
 
@@ -21,34 +52,50 @@ export function extractInlineMetadataFromLines(lines) {
     else if (line.startsWith('Priority:')) { metadata.priority = line.substring(9).trim(); matchedIndices.add(i); }
     else if (line.startsWith('Completion:')) { metadata.completion = parseFloat(line.substring(11).trim()); matchedIndices.add(i); }
     else if (line.startsWith('Summary:')) { metadata.summary = line.substring(8).trim(); matchedIndices.add(i); }
-    else {
-      // Extract any other Key: Value properties (for Notion database properties)
-      const match = line.match(/^([^:#!\[\]*\->`•│├└\n\r][^:\n\r]*):\s*(.+)$/);
-      if (match) {
-        const key = sanitizeKey(match[1]);
-        let value = match[2].trim();
-        
-        let j = i + 1;
-        while (j < lines.length && (lines[j].startsWith('- ') || lines[j].startsWith('* '))) {
-          value += '\n' + lines[j];
-          matchedIndices.add(j);
-          j++;
+    else if (inferMetadata) {
+      const genericProperty = extractGenericInlineProperty(lines, i);
+      if (genericProperty && !metadata[genericProperty.key]) {
+        if (genericProperty.key === 'tags') {
+          metadata[genericProperty.key] = genericProperty.value.split(',').map(t => t.trim()).filter(t => t);
+        } else {
+          metadata[genericProperty.key] = genericProperty.value;
         }
-        
-        if (key && value && !metadata[key]) {
-          // Split comma-separated values for tag fields
-          if (key === 'tags') {
-            metadata[key] = value.split(',').map(t => t.trim()).filter(t => t);
-          } else {
-            metadata[key] = value;
-          }
-          matchedIndices.add(i);
+        matchedIndices.add(i);
+        for (const continuationIndex of genericProperty.continuationIndices) {
+          matchedIndices.add(continuationIndex);
         }
       }
     }
   }
 
   return { metadata, matchedIndices };
+}
+
+function collectInlineScanLines(lines, inferMetadata) {
+  const inlineScanLines = [];
+  let sawMetadataLine = false;
+
+  for (let i = 0; i < Math.min(30, lines.length); i++) {
+    const line = lines[i];
+    inlineScanLines.push(line);
+
+    if (!line.trim()) {
+      if (sawMetadataLine) {
+        break;
+      }
+      continue;
+    }
+
+    const genericProperty = inferMetadata ? extractGenericInlineProperty(lines, i) : null;
+    if (isRecognizedInlineMetadataKey(line) || genericProperty) {
+      sawMetadataLine = true;
+      continue;
+    }
+
+    break;
+  }
+
+  return inlineScanLines;
 }
 
 export function getTagsFromPath(filePath, baseDir) {
@@ -295,7 +342,8 @@ export function cleanAssetPaths(content, dirNameMap) {
  * @param {Array} lines - Content lines
  * @returns {Object} - Extracted properties and remaining content lines
  */
-export function extractDatabaseProperties(lines) {
+export function extractDatabaseProperties(lines, options = {}) {
+  const { inferMetadata = true } = options;
   const properties = {};
   let foundFirstHeading = false;
   let headingIndex = -1;
@@ -319,7 +367,7 @@ export function extractDatabaseProperties(lines) {
     if (foundFirstHeading) {
       const propertyMatch = line.match(/^([^:#!\[\]*\->`•│├└\n\r][^:\n\r]*):\s+(.+)$/);
       
-      if (propertyMatch) {
+      if (propertyMatch && inferMetadata) {
         const key = propertyMatch[1];
         let value = propertyMatch[2].trim();
         
@@ -390,7 +438,8 @@ export function extractDatabaseProperties(lines) {
   return { properties, remainingLines: lines };
 }
 
-export async function processFileContent(filePath, metadata, fileMap, baseDir, dirNameMap = new Map()) {
+export async function processFileContent(filePath, metadata, fileMap, baseDir, dirNameMap = new Map(), options = {}) {
+  const { inferMetadata = false } = options;
   const file = Bun.file(filePath);
   const content = await file.text();
 
@@ -402,7 +451,7 @@ export async function processFileContent(filePath, metadata, fileMap, baseDir, d
   const lines = content.split('\n');
 
   // Extract Notion database properties from content body
-  const { properties: dbProperties, remainingLines } = extractDatabaseProperties(lines);
+  const { properties: dbProperties, remainingLines } = extractDatabaseProperties(lines, { inferMetadata });
   // Merge tags arrays instead of overwriting
   if (dbProperties.tags && Array.isArray(metadata.tags)) {
     const newTags = Array.isArray(dbProperties.tags) ? dbProperties.tags : [dbProperties.tags];
@@ -411,15 +460,8 @@ export async function processFileContent(filePath, metadata, fileMap, baseDir, d
   }
   Object.assign(metadata, dbProperties);
 
-  const inlineScanLines = [];
-  for (let i = 0; i < Math.min(30, remainingLines.length); i++) {
-    inlineScanLines.push(remainingLines[i]);
-    if (i > 0 && remainingLines[i].trim() === '') {
-      break;
-    }
-  }
-
-  const { metadata: inlineMetadata, matchedIndices } = extractInlineMetadataFromLines(inlineScanLines);
+  const inlineScanLines = collectInlineScanLines(remainingLines, inferMetadata);
+  const { metadata: inlineMetadata, matchedIndices } = extractInlineMetadataFromLines(inlineScanLines, { inferMetadata });
   // Merge tags arrays instead of overwriting
   if (inlineMetadata.tags && Array.isArray(metadata.tags)) {
     const newTags = Array.isArray(inlineMetadata.tags) ? inlineMetadata.tags : [inlineMetadata.tags];
@@ -554,9 +596,9 @@ function replaceOutsideFrontmatter(content, replacer) {
   return frontmatterBlock + replacer(body);
 }
 
-export async function updateFileContent(filePath, metadata, fileMap, baseDir, dirNameMap = new Map()) {
+export async function updateFileContent(filePath, metadata, fileMap, baseDir, dirNameMap = new Map(), options = {}) {
   try {
-    const { newContent, linkCount, skipped, calloutsConverted } = await processFileContent(filePath, metadata, fileMap, baseDir, dirNameMap);
+    const { newContent, linkCount, skipped, calloutsConverted } = await processFileContent(filePath, metadata, fileMap, baseDir, dirNameMap, options);
 
     // Skip completely empty files
     if (skipped) {

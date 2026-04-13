@@ -61,13 +61,24 @@ describe("Notion ID Detection", () => {
 
 describe("marker-based wikilink rewriting", () => {
   test("md marker pattern extracts display text and notionObjectId", () => {
-    const markerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__\]\]/gi;
+    const markerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?\]\]/gi;
     const content = "See [[Untitled|__MD_11111111111111111111111111111111__]] for details.";
     const matches = [...content.matchAll(markerPattern)];
 
     expect(matches.length).toBe(1);
     expect(matches[0][1]).toBe("Untitled");
     expect(matches[0][2]).toBe("11111111111111111111111111111111");
+  });
+
+  test("md marker pattern extracts optional encoded anchor", () => {
+    const markerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?\]\]/gi;
+    const encodedAnchor = Buffer.from("section heading", "utf8").toString("base64url");
+    const content = `See [[Untitled|__MD_11111111111111111111111111111111__~${encodedAnchor}]] for details.`;
+    const matches = [...content.matchAll(markerPattern)];
+
+    expect(matches.length).toBe(1);
+    expect(matches[0][2]).toBe("11111111111111111111111111111111");
+    expect(matches[0][3]).toBe(encodedAnchor);
   });
 
   test("marker pattern extracts dbName and notionObjectId", () => {
@@ -221,7 +232,7 @@ describe("marker-based wikilink rewriting", () => {
       ["22222222222222222222222222222222", { wikiTarget: "topic/Untitled-2", title: "Untitled-2" }]
     ]);
 
-    const mdMarkerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__\]\]/gi;
+    const mdMarkerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?\]\]/gi;
     const content = "[[Untitled|__MD_11111111111111111111111111111111__]]";
     const result = content.replace(mdMarkerPattern, (match, displayText, notionObjectId) => {
       const targetInfo = noteObjectIdMap.get(notionObjectId);
@@ -233,6 +244,26 @@ describe("marker-based wikilink rewriting", () => {
     });
 
     expect(result).toBe("[[topic/Untitled]]");
+  });
+
+  test("md marker replacement restores exact child note path and anchor by notion-id", () => {
+    const noteObjectIdMap = new Map([
+      ["11111111111111111111111111111111", { wikiTarget: "topic/Untitled", title: "Untitled" }]
+    ]);
+    const encodedAnchor = Buffer.from("section heading", "utf8").toString("base64url");
+    const mdMarkerPattern = /\[\[([^|\]]+)\|__MD_([a-f0-9]{32})__(?:~([A-Za-z0-9_-]+))?\]\]/gi;
+    const content = `[[Untitled|__MD_11111111111111111111111111111111__~${encodedAnchor}]]`;
+    const result = content.replace(mdMarkerPattern, (match, displayText, notionObjectId, encodedFragment) => {
+      const targetInfo = noteObjectIdMap.get(notionObjectId);
+      const anchor = encodedFragment ? Buffer.from(encodedFragment, "base64url").toString("utf8") : "";
+      const targetWithAnchor = anchor ? `${targetInfo.wikiTarget}#${anchor}` : targetInfo.wikiTarget;
+      if (displayText === targetInfo.title) {
+        return `[[${targetWithAnchor}]]`;
+      }
+      return `[[${targetWithAnchor}|${displayText}]]`;
+    });
+
+    expect(result).toBe("[[topic/Untitled#section heading]]");
   });
 
   test("missing marker target is preserved as plain wikilink and does not enter heuristic rewrite", async () => {
@@ -1323,6 +1354,19 @@ describe("CSV object ID marker in link conversion", () => {
     expect(result).toBe("[[Untitled|__MD_11111111111111111111111111111111__]]");
   });
 
+  test("convertMarkdownLinkToWiki preserves anchor in md marker for Notion ID links", async () => {
+    const { convertMarkdownLinkToWiki } = await import("./src/lib/links.js");
+    const encodedAnchor = Buffer.from("section heading", "utf8").toString("base64url");
+
+    const result = convertMarkdownLinkToWiki(
+      "[Untitled](topic/Untitled%2011111111111111111111111111111111.md#section%20heading)",
+      new Map(),
+      "/some/path/topic.md",
+      "/some/path"
+    );
+    expect(result).toBe(`[[Untitled|__MD_11111111111111111111111111111111__~${encodedAnchor}]]`);
+  });
+
   test("convertMarkdownLinkToWiki adds object ID marker for CSV with Notion ID", async () => {
     const { convertMarkdownLinkToWiki } = await import("./src/lib/links.js");
     
@@ -1397,6 +1441,21 @@ describe("row-directory scoring guards", () => {
     }
 
     expect(matchCount).toBe(1);
+  });
+});
+
+describe("CLI argument parsing", () => {
+  test("parseArgs enables inferMetadata for --infer-metadata", async () => {
+    const originalArgv = process.argv;
+    process.argv = ["bun", "notion2obsidian", "./Export.zip", "--infer-metadata"];
+
+    try {
+      const { parseArgs } = await import("./src/lib/cli.js");
+      const config = parseArgs();
+      expect(config.inferMetadata).toBe(true);
+    } finally {
+      process.argv = originalArgv;
+    }
   });
 });
 
@@ -1903,18 +1962,27 @@ describe("extractInlineMetadataFromLines returns matchedIndices", () => {
     expect(matchedIndices.size).toBe(0);
   });
 
-  test("should match custom Key: Value properties", () => {
+  test("should not infer generic Key: Value properties by default", () => {
     const lines = ["Turtle Type: Snapping", "Color: Green"];
     const { metadata, matchedIndices } = extractInlineMetadataFromLines(lines);
+
+    expect(metadata["turtle-type"]).toBeUndefined();
+    expect(metadata.color).toBeUndefined();
+    expect(matchedIndices.size).toBe(0);
+  });
+
+  test("should infer generic Key: Value properties when enabled", () => {
+    const lines = ["Turtle Type: Snapping", "Color: Green"];
+    const { metadata, matchedIndices } = extractInlineMetadataFromLines(lines, { inferMetadata: true });
 
     expect(metadata["turtle-type"]).toBe("Snapping");
     expect(metadata.color).toBe("Green");
     expect(matchedIndices.size).toBe(2);
   });
 
-  test("should match property keys with parentheses", () => {
+  test("should infer property keys with parentheses when enabled", () => {
     const lines = ["Height (cm): 180", "Weight(kg): 75", "Waist (in): 30"];
-    const { metadata, matchedIndices } = extractInlineMetadataFromLines(lines);
+    const { metadata, matchedIndices } = extractInlineMetadataFromLines(lines, { inferMetadata: true });
 
     expect(metadata["height-cm"]).toBe("180");
     expect(metadata["weightkg"]).toBe("75");
@@ -1922,21 +1990,30 @@ describe("extractInlineMetadataFromLines returns matchedIndices", () => {
     expect(matchedIndices.size).toBe(3);
   });
 
-  test("should split comma-separated tags into array", () => {
+  test("should split comma-separated tags into array when inference is enabled", () => {
     const lines = ["Tags: Coding, Design, Testing"];
-    const { metadata, matchedIndices } = extractInlineMetadataFromLines(lines);
+    const { metadata, matchedIndices } = extractInlineMetadataFromLines(lines, { inferMetadata: true });
 
     expect(Array.isArray(metadata.tags)).toBe(true);
     expect(metadata.tags).toEqual(["Coding", "Design", "Testing"]);
     expect(matchedIndices.size).toBe(1);
   });
 
-  test("should handle single tag value without splitting", () => {
+  test("should handle single tag value without splitting when inference is enabled", () => {
     const lines = ["Tags: Coding"];
-    const { metadata } = extractInlineMetadataFromLines(lines);
+    const { metadata } = extractInlineMetadataFromLines(lines, { inferMetadata: true });
 
     expect(Array.isArray(metadata.tags)).toBe(true);
     expect(metadata.tags).toEqual(["Coding"]);
+  });
+
+  test("should still extract recognized inline metadata keys by default", () => {
+    const lines = ["Status: Done", "Summary: Ship it"];
+    const { metadata, matchedIndices } = extractInlineMetadataFromLines(lines);
+
+    expect(metadata.status).toBe("Done");
+    expect(metadata.summary).toBe("Ship it");
+    expect(matchedIndices.size).toBe(2);
   });
 });
 
@@ -2342,6 +2419,22 @@ describe("buildPageNameSet", () => {
     expect(names.has("Another Page")).toBe(true);
     expect(names.size).toBe(2);
   });
+
+  test("should exclude duplicate cleaned page names", () => {
+    const fileMap = new Map();
+    fileMap.set("Project one.md", {
+      cleanedName: "Project.md",
+      relativePath: "alpha"
+    });
+    fileMap.set("Project two.md", {
+      cleanedName: "Project.md",
+      relativePath: "beta"
+    });
+
+    const names = buildPageNameSet(fileMap);
+    expect(names.has("Project")).toBe(false);
+    expect(names.size).toBe(0);
+  });
 });
 
 describe("convertAtMentions", () => {
@@ -2382,6 +2475,13 @@ describe("convertAtMentions", () => {
     const input = "@Special Task Force Alpha";
     const result = convertAtMentions(input, names);
     expect(result).toBe("[[Special Task Force Alpha]]");
+  });
+
+  test("should not convert duplicate-title @ mentions", () => {
+    const names = new Set(["Alpha Project X"]);
+    const input = "Task for @Project";
+    const result = convertAtMentions(input, names);
+    expect(result).toBe("Task for @Project");
   });
 });
 
@@ -2757,11 +2857,11 @@ describe("convertAtMentions — double-bracket prevention", () => {
 });
 
 describe("extractInlineMetadataFromLines — emoji property keys", () => {
-  test("extracts emoji-prefixed properties with correct key format", () => {
+  test("extracts emoji-prefixed properties with correct key format when inference is enabled", () => {
     const { metadata } = extractInlineMetadataFromLines([
       '🛒 Shop Listing: Available',
       '📝 Description: A cool item',
-    ]);
+    ], { inferMetadata: true });
     expect(metadata['shop-listing']).toBe('Available');
     expect(metadata['description']).toBe('A cool item');
     expect(metadata).not.toHaveProperty('-shop-listing');
@@ -3385,11 +3485,10 @@ describe("bases mode reciprocal link regressions", () => {
 
   test("processFileContent keeps @ title literal in frontmatter", async () => {
     const { join } = await import("node:path");
-    const { rm, mkdir } = await import("node:fs/promises");
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
 
-    const dir = join(process.cwd(), "test_qa_unit_title");
-    await rm(dir, { recursive: true, force: true });
-    await mkdir(dir, { recursive: true });
+    const dir = await mkdtemp(join(tmpdir(), "n2o-title-"));
 
     const filePath = join(dir, "@Alex face0000000000000000000000000001.md");
     await Bun.write(filePath, "# @Alex\n\nBody\n");
@@ -3399,7 +3498,7 @@ describe("bases mode reciprocal link regressions", () => {
       ["Alex.md", { cleanedName: "Alex.md", fullPath: filePath, relativePath: "." }]
     ]);
 
-    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map());
+    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map(), { inferMetadata: true });
     expect(result.newContent).toContain('title: "@Alex"');
     expect(result.newContent).not.toContain('title: "[[Alex]]"');
 
@@ -3408,11 +3507,10 @@ describe("bases mode reciprocal link regressions", () => {
 
   test("processFileContent does not promote body Key:Value line after property block", async () => {
     const { join } = await import("node:path");
-    const { rm, mkdir } = await import("node:fs/promises");
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
 
-    const dir = join(process.cwd(), "test_qa_unit_property_boundary");
-    await rm(dir, { recursive: true, force: true });
-    await mkdir(dir, { recursive: true });
+    const dir = await mkdtemp(join(tmpdir(), "n2o-boundary-"));
 
     const filePath = join(dir, "Day Log abc123def456789012345678901234ab.md");
     await Bun.write(filePath, "# Day Log\n\nDate: May 29, 2023\nContent: A,B,C\n\nCinematic Mindscapes: High-quality Video Reconstruction from Brain Activity\n");
@@ -3422,7 +3520,7 @@ describe("bases mode reciprocal link regressions", () => {
       ["Day Log abc123def456789012345678901234ab.md", { cleanedName: "Day Log.md", fullPath: filePath, relativePath: "." }]
     ]);
 
-    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map());
+    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map(), { inferMetadata: true });
     expect(result.newContent).toContain('date: "May 29, 2023"');
     expect(result.newContent).toContain('content: "A,B,C"');
     expect(result.newContent).not.toContain('cinematic-mindscapes:');
@@ -3430,13 +3528,65 @@ describe("bases mode reciprocal link regressions", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  test("processFileContent keeps opening prose Key:Value lines in the body by default", async () => {
+    const { join } = await import("node:path");
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+
+    const dir = await mkdtemp(join(tmpdir(), "n2o-opening-prose-"));
+
+    const filePath = join(dir, "Draft Notes abc123def456789012345678901234ab.md");
+    await Bun.write(filePath, "# Draft Notes\n\nNote: draft\nWhy: because\nTL;DR: short\n");
+
+    const metadata = { title: "Draft Notes", published: false };
+    const fileMap = new Map([
+      ["Draft Notes abc123def456789012345678901234ab.md", { cleanedName: "Draft Notes.md", fullPath: filePath, relativePath: "." }]
+    ]);
+
+    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map());
+    expect(result.newContent).toContain("Note: draft");
+    expect(result.newContent).toContain("Why: because");
+    expect(result.newContent).toContain("TL;DR: short");
+    expect(result.newContent).not.toContain('note: "draft"');
+    expect(result.newContent).not.toContain('why: "because"');
+    expect(result.newContent).not.toContain('tldr: "short"');
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("processFileContent infers bounded opening Key:Value metadata with --infer-metadata behavior", async () => {
+    const { join } = await import("node:path");
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+
+    const dir = await mkdtemp(join(tmpdir(), "n2o-infer-metadata-"));
+
+    const filePath = join(dir, "Draft Notes abc123def456789012345678901234ab.md");
+    await Bun.write(filePath, "# Draft Notes\n\nClient: Acme\nTags: Ops, Launch\n\nBody paragraph starts here.\nWhy: keep in body\n");
+
+    const metadata = { title: "Draft Notes", published: false };
+    const fileMap = new Map([
+      ["Draft Notes abc123def456789012345678901234ab.md", { cleanedName: "Draft Notes.md", fullPath: filePath, relativePath: "." }]
+    ]);
+
+    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map(), { inferMetadata: true });
+    const parsed = matter(result.newContent);
+
+    expect(parsed.data.client).toBe("Acme");
+    expect(parsed.data.tags).toEqual(["Ops", "Launch"]);
+    expect(result.newContent).not.toContain("Client: Acme");
+    expect(result.newContent).not.toContain("Tags: Ops, Launch");
+    expect(result.newContent).toContain("Why: keep in body");
+
+    await rm(dir, { recursive: true, force: true });
+  });
+
   test("processFileContent keeps frontmatter YAML parseable when property links include bracketed titles", async () => {
     const { join } = await import("node:path");
-    const { rm, mkdir } = await import("node:fs/promises");
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
 
-    const dir = join(process.cwd(), "test_qa_unit_frontmatter_yaml_escape");
-    await rm(dir, { recursive: true, force: true });
-    await mkdir(dir, { recursive: true });
+    const dir = await mkdtemp(join(tmpdir(), "n2o-yaml-escape-"));
 
     const filePath = join(dir, "Dashboard Overview face000000000000000000000000000f.md");
     await Bun.write(
@@ -3451,7 +3601,7 @@ describe("bases mode reciprocal link regressions", () => {
       ["[tv] Series Pilot 01 face0000000000000000000000000005.md", { cleanedName: "[tv] Series Pilot 01.md", fullPath: join(dir, "[tv] Series Pilot 01 face0000000000000000000000000005.md"), relativePath: "." }]
     ]);
 
-    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map());
+    const result = await processFileContent(filePath, metadata, fileMap, dir, new Map(), { inferMetadata: true });
     const parsed = matter(result.newContent);
 
     expect(parsed.data.title).toBe("Dashboard Overview");

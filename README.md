@@ -43,9 +43,11 @@
    - Notion IDs for reference
    - Folder paths for duplicate disambiguation
    - Inline metadata (Status, Owner, Dates, Priority, Completion, Summary)
+   - Conservative default handling for generic `Key: value` prose
+   - Optional top-of-note `Key: value` inference with `--infer-metadata`
 3. **Converts links**: Transforms `[text](file.md)` → `[[file|text]]`
-4. **Handles anchors**: Preserves section links like `[text](file.md#section)` → `[[file#section|text]]`
-5. **Processes duplicates**: Uses folder context to handle files with identical names
+4. **Handles anchors**: Preserves section links like `[text](file.md#section)` → `[[file#section|text]]`, including links restored through Notion object IDs
+5. **Processes duplicates**: Uses folder context to handle files with identical names and avoids ambiguous auto-linked `@mentions`
 6. **Renames files and directories**: Strips Notion IDs from all names
 7. **Updates asset paths**: Fixes image and file references after directory renaming
 8. **Converts callouts**: Transforms Notion callouts (with icons) to Obsidian format
@@ -120,12 +122,17 @@ notion2obsidian
                     # (extracts 10% sample or 10MB max for zip files)
 -v, --verbose       # Show detailed processing information
     --enrich        # Enrich vault with Notion API metadata (dates, URLs, assets)
+    --infer-metadata
+                    # Heuristically infer generic Key: value metadata near note tops
     --no-callouts   # Disable Notion callout conversion to Obsidian callouts
     --no-csv        # Disable CSV database processing and index generation
     --dataview      # Create individual markdown notes from CSV rows (default: CSV only)
     --sqlseal       # Use SQL Seal query syntax instead of Dataview (default: Dataview)
+    --bases         # Use Obsidian Bases format for CSV databases
 -h, --help          # Show help message
 ```
+
+`--infer-metadata` is off by default. Without it, the tool only promotes the documented inline fields (`Status`, `Owner`, `Dates`, `Priority`, `Completion`, `Summary`) and leaves generic opening prose such as `Note: draft` in the note body.
 
 ### Examples
 
@@ -151,6 +158,9 @@ notion2obsidian *.zip ~/Vault --dry-run
 # Create individual notes from CSV rows (optional)
 notion2obsidian ./Export-abc123.zip ~/Vault --dataview
 
+# Opt in to broader inline metadata inference
+notion2obsidian ./Export-abc123.zip ~/Vault --infer-metadata
+
 # Use SQL Seal for database queries (alternative to Dataview)
 notion2obsidian ./Export-abc123.zip ~/Vault --sqlseal
 
@@ -160,6 +170,19 @@ notion2obsidian ./Export-abc123.zip ~/Vault --no-callouts --no-csv
 # Using bunx (no install required)
 bunx notion2obsidian ./Export-abc123.zip ~/Vault
 ```
+
+### Inline Metadata Behavior
+
+By default, notion2obsidian keeps generic colon-delimited prose in the note body and only extracts the documented inline fields:
+
+- `Status:`
+- `Owner:`
+- `Dates:`
+- `Priority:`
+- `Completion:`
+- `Summary:`
+
+Use `--infer-metadata` if you want the tool to also promote other top-of-note `Key: value` lines into frontmatter. This inference is intentionally bounded to the opening metadata block so later body prose is not silently removed.
 
 ## 📦 Zip File Support
 

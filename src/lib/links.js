@@ -37,6 +37,12 @@ export function buildFileMap(files, baseDir) {
   return fileMap;
 }
 
+function encodeMarkerAnchor(anchor) {
+  const normalized = String(anchor || '').trim();
+  if (!normalized) return '';
+  return Buffer.from(normalized, 'utf8').toString('base64url');
+}
+
 // ============================================================================
 // Property Value Link Conversion
 // ============================================================================
@@ -293,14 +299,19 @@ export function convertMarkdownLinkToWiki(link, fileMap, currentFilePath, baseDi
   const notionObjectId = extractNotionId(targetFilename)?.toLowerCase() || null;
 
   if (notionObjectId) {
-    const marker = `__MD_${notionObjectId}__`;
+    const decodedAnchor = anchor ? decodeURIComponent(anchor) : '';
+    const encodedAnchor = decodedAnchor ? encodeMarkerAnchor(decodedAnchor) : '';
+    const marker = encodedAnchor
+      ? `__MD_${notionObjectId}__~${encodedAnchor}`
+      : `__MD_${notionObjectId}__`;
     const displayText = (decodedLinkText || cleanedName).trim();
     if (!displayText) return link;
     return `[[${displayText}|${marker}]]`;
   }
 
   // Build wiki link with optional anchor
-  const anchorPart = anchor ? `#${anchor}` : '';
+  const decodedAnchor = anchor ? decodeURIComponent(anchor) : '';
+  const anchorPart = decodedAnchor ? `#${decodedAnchor}` : '';
 
   if (decodedLinkText === cleanedName || decodedLinkText === cleanedFilename) {
     // Simple wiki link
@@ -316,10 +327,17 @@ export function convertMarkdownLinkToWiki(link, fileMap, currentFilePath, baseDi
 // ============================================================================
 
 export function buildPageNameSet(fileMap) {
-  const names = new Set();
+  const nameCounts = new Map();
   for (const [, entry] of fileMap) {
     const name = entry.cleanedName.replace(/\.md$/, '');
-    if (name) names.add(name);
+    if (name) {
+      nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+    }
+  }
+
+  const names = new Set();
+  for (const [name, count] of nameCounts) {
+    if (count === 1) names.add(name);
   }
   return names;
 }
